@@ -1,0 +1,93 @@
+<USER_REQUEST>
+You are upgrading the visual design of the existing NexMind graph view (nexmind/backend = FastAPI + networkx, nexmind/frontend = React + Vite + TypeScript + three.js using the "3d-force-graph" library with server-computed fixed positions).
+RULES: Keep the project structure, routes, features and the dark "deep sea" look. Edit only the files listed. You MAY add three small new files: frontend/src/three/edges.ts, frontend/src/three/labels.ts, frontend/src/three/shapes.ts. Do not touch chat, drawer, ingestion, or auth. Windows PowerShell: one command per line, never "&&".
+Verify at the end:  backend: python -m pytest tests -q   frontend: npm run typecheck ; npm run build   — then list every file and function changed.
+
+GOAL: a graph that reads like a map, not a glowing blur. Clear groups, visible and typed relationships, sizes that mean something, labels that never overlap, smooth at 60 fps with ~400 to 2,000 nodes and up to ~6,000 links.
+
+================ PART 1. LAYOUT (backend) ================
+Files: backend/nexmind/graph/analysis.py (layout_3d), backend/nexmind/ingest/pipeline.py (call site + _viz_node), backend/nexmind/api/graph_routes.py (new endpoint), backend/tests/test_e2e.py (tests).
+
+1. Tighter clusters. In layout_3d, after the existing seeded + spring_layout step, run "cluster fusion": move every node 40% of the way toward its cluster centroid (cluster 0 "loose" nodes move toward the centroid of their strongest-linked neighbour's cluster instead of sitting in the outer shell; delete the outer-shell placement entirely). Increase the distance between cluster centres by 20% so groups are separated, not merged.
+2. Anti-collision. Add a separation pass: node radius r(n) = 2 + 6*sqrt(score) (world units). For 8 iterations use scipy.spatial.cKDTree.query_pairs(2*max_r*1.2) on the positions; for each pair closer than (r_a + r_b)*1.25 push both apart along the connecting vector by half the overlap (random unit vector if identical). Keep nodes inside their cluster's bounding sphere (clamp to 1.35 x cluster radius). Must stay O(n log n) and finish in < 2 s for 2,000 nodes.
+3. Concentric layering for document-heavy graphs. Add layout mode: if count(Document+Section+Concept+Entity) > count(Function+Method+Class), place nodes on concentric shells by type while keeping each cluster in its own angular sector: radius by type = Source 0, Document 70, Concept 130, Section 190, Entity 250 (world units); direction = the node's cluster-sector direction (the Fibonacci-sphere direction already used for cluster centres) plus small jitter proportional to cluster size; nodes in the same cluster and type spread on their shell with the collision pass above. Code-heavy graphs keep the organic layout from steps 1-2.
+4. Degree in the payload. In pipeline._viz_node include "degree": props.get("degree", 0). Also in graph_routes get_graph links keep as is.
+5. New endpoint POST /api/workspaces/{ws_id}/relayout: load the stored graph (store.get), recompute layout (clusters stay as stored; build U from stored edges via analysis.build_undirected, positions via the new layout_3d), update x,y,z in memory and in the nodes table (UPDATE ... WHERE workspace_id AND id, executemany), recompute Process node centroids, call store.invalidate, publish a hub event {"type":"relayout_done"} and return {"nodes": n}. No re-parsing, so it takes seconds.
+6. Tests (tests/test_e2e.py): (a) after a build, no two non-Process nodes are closer than 1.2 world units; (b) mean distance of nodes to their cluster centroid is lower than the old layout's value (store a constant threshold measured from the sample project, with 15% tolerance); (c) a docs-heavy workspace has mean radius Document < Concept < Entity; (d) POST relayout returns 200 and the graph still loads.
+
+================ PART 2. NODES (frontend/src/three/engine.ts, new shapes.ts) ================
+1. Size by degree. Compute degree from the full links array on setData/addBatch (maintain a Map). Node base size = base(type) * (0.75 + 1.25 * log2(1 + degree) / log2(1 + maxDegree)), with base(type) from the existing TYPE_SIZE, minimum 4.5, maximum 22. Bridge nodes (degree in the top 3%) get a thin outer ring.
+2. Distinct shapes per type (crisp, not blobs), drawn once to small canvas textures in shapes.ts and shared: Document = rounded square, Section = small rounded square, Class = hexagon, File = square with notch (or plain square), Function/Method = circle (Method smaller, hollow ring), Concept = diamond, Entity = circle with inner dot, Source = star/large circle, Module = triangle, Process = double ring. Each texture: solid fill at 0.9 alpha, 1.5 px brighter rim, and only a very soft 20% halo (no wide glow). Use NormalBlending for all nodes (no additive blending for nodes).
+3. Palette (replace NODE_COLORS in engine.ts, keep the same keys, slightly desaturated so neighbours are distinguishable): Source #F3F7FF, Folder #7F93AD, File #4CC9F0, Document #FFB35C, Section #E9C79A, Class #A99BFF, Function #4FE3C1, Method #8FDCCB, Module #FF7EB6, Concept #FFD666, Entity #FF8A8A, Process #38E8FF. Cluster hull colour comes from the cluster.color.
+4. Hierarchy by contrast, not glow: leaf nodes (degree <= 1) drawn at 55% opacity and 80% size unless hovered/selected/focused; hubs 100%. Bloom is only for hovered/selected/flash/ring and the top 2% hubs: UnrealBloomPass(strength 0.5 * glow, radius 0.35, threshold 0.7) and keep the "Glow" slider if it exists (default 35%).
+5. Background: scene.background #050B16, fog colour the same, FogExp2 density 0.0007 (no lightening of the scene), plus a CSS radial vignette over the canvas. Dust particles: 600, opacity 0.18.
+
+================ PART 3. EDGES (frontend/src/three/edges.ts, engine.ts) ================
+Replace the library's per-link objects with ONE batched edge renderer (this is also the main performance fix):
+1. Call fg.linkVisibility(() => false) and fg.enablePointerInteraction handling stays for nodes only. Build edges with three/examples/jsm/lines: LineSegments2 + LineSegmentsGeometry + LineMaterial (screen-space width, vertexColors, transparent). Update LineMaterial.resolution on resize. Three groups, each one draw call:
+   - DIRECT (solid): CALLS width 1.6, IMPORTS 1.3, INHERITS 2.6, REFERENCES 2.0 (these are the citation-like links), RELATION 1.8.
+   - WEAK (dashed, dashSize 3, gapSize 2.5): MENTIONS, RELATED_TO, SIMILAR_TO, width 1.0.
+   - STRUCTURAL (solid, very faint): CONTAINS, DEFINES, HAS_STEP width 0.8, opacity 0.12.
+2. Gradient links: vertex colour at the source end = source node colour, at the target end = target node colour (instanceColorStart/End). Base opacity 0.55 for DIRECT, 0.32 for WEAK, 0.12 for STRUCTURAL. Edges must be clearly visible at rest; this replaces the earlier "almost invisible" edge blending.
+3. Directional arrows: one THREE.InstancedMesh of small cones (radius 0.9, height 2.6) placed at 82% along CALLS, IMPORTS, INHERITS, REFERENCES, RELATION edges, oriented from source to target, coloured like the edge. If those edges exceed 600, draw arrows only for emphasised edges plus the 300 highest-weight ones. Hide arrows when the camera is farther than 700 units.
+4. Emphasis: on hover/select/focus, edges not in the emphasis set drop to 8% opacity, emphasised edges go to 100% with width x1.5; update the colour attribute in place (never rebuild geometry), debounced to one update per animation frame, skipped when the emphasis set did not change. Edge types hidden by filters or whose endpoints are hidden are removed from the buffers.
+5. Cap: if there are > 2,500 edges, draw the DIRECT group in full, WEAK limited to the 1,200 highest weights, STRUCTURAL limited to edges whose endpoints both have degree >= 3; all edges of hovered/selected/focused nodes are always included.
+6. Edge hover/click without raycasting thousands of lines: for the selected or hovered node only, compute screen-space distance from the pointer to its (at most ~60) edges, throttled to 50 ms; within 6 px set hoverEdge and call the existing onEdgeHover/onEdgeClick callbacks.
+7. Old ambient particles: keep at most 40 moving "signal" dots, as small Points travelling along random DIRECT edges (CPU-updated, one draw call). No library link particles.
+
+================ PART 4. CLUSTER BOUNDARIES (engine.ts) ================
+Replace the faint nebula sprites with convex hulls: for every cluster with >= 4 points, build a THREE.Mesh using ConvexGeometry (three/examples/jsm/geometries/ConvexGeometry.js) from the member positions (subsample to <= 160 points, expand each point 10% away from the centroid for padding). Material: MeshBasicMaterial colour cluster.color, transparent, opacity 0.05, depthWrite false, side DoubleSide; plus a second, wireframe-only EdgesGeometry line with opacity 0.10. On hovering a node, raise its cluster hull to opacity 0.10. Rebuild hulls only after graph_ready, relayout_done or filter changes (debounced 300 ms). If ConvexGeometry throws (coplanar points) fall back to a soft sprite.
+
+================ PART 5. LABELS (new labels.ts, GraphCanvas.tsx, engine.ts) ================
+Replace the canvas-texture label sprites with a DOM label layer (absolute-positioned divs inside the canvas container, pointer-events none, pooled, max 45 elements) updated at 10 Hz by a function engine.updateLabels():
+1. Candidates and priority: cluster names (priority by cluster size), then hovered/selected/focused nodes, then nodes by degree (top 3% always candidates), then the rest.
+2. Progressive disclosure by camera distance d: d > 600 only cluster names; 250 < d <= 600 cluster names + the top 3% nodes by degree; d <= 250 add nodes with degree >= 4; hovered/selected/focused and their direct neighbours (labels dimmer) always.
+3. Occlusion prevention: project each candidate to screen, measure its box (text width estimate = 7px * chars + 18px, height 22px), and place greedily in priority order: skip any label whose box overlaps an already placed one (with 4 px margin) or lies outside the viewport or behind the camera. Try 4 alternative offsets (below, above, right, left of the node) before skipping. Cache boxes between frames and animate opacity (150 ms CSS transition) so labels fade rather than pop.
+4. Style: a dark plate (background rgba(5,11,22,0.72), 1px border rgba(255,255,255,0.08), border-radius 999px, padding 2px 9px, font 12px "Bricolage Grotesque", colour #E7F3FF; cluster names 13px weight 600 with a 6px dot in the cluster colour). Truncate to 28 chars with an ellipsis; full text in the title attribute.
+
+================ PART 6. STRUCTURAL FILTERING (LeftRail.tsx FiltersPanel, store.ts, actions.ts, engine.ts) ================
+1. Add preset chips at the top of the Filters panel: "Everything", "Overview" (Source, Document, Class, File, Concept, Module), "Concepts and documents" (Document, Section, Concept only), "Code only" (File, Class, Function, Method, Module), "Hide entities" (all except Entity). Clicking a preset sets hiddenTypes; the existing per-type chips remain and show the active state.
+2. Add a "Hide leaf nodes (degree <= 1)" switch and a "Show only direct relationships" switch (hides WEAK and STRUCTURAL edge groups). Store fields: hideLeaves:boolean, directOnly:boolean; applyFilters() passes them to engine.setFilters(types, clusters, minScore, {hideLeaves, directOnly}).
+3. Add a "Tidy layout" button (with a short hint "Recompute positions for tighter groups") that calls POST /api/workspaces/{id}/relayout (add api.relayout(id) in lib/api.ts) and then loadGraph(id). Show a toast on completion. Handle the "relayout_done" socket event by reloading the graph.
+4. Add a small legend block under the filters: edge types with a sample line style (solid / dashed / arrow) so users can read the visual language.
+
+================ PERFORMANCE RULES (must hold) ================
+- No per-frame allocation inside loops (reuse Color/Vector3 objects); node loop processes 1/3 of nodes per frame except flashing/growing ones.
+- Hover/pointer picking is throttled to 50 ms and disabled while the user is rotating or zooming (resume 160 ms after the last interaction).
+- Edge buffers updated in place, at most once per frame. graphData() commits during streaming at most every 250 ms.
+- Keep the session-only low-FPS fallback (never persisted); low mode = no bloom, no hulls wireframe, no arrows, no signal dots.
+- ?fps=1 on the URL shows a small readout: fps · nodes · links · drawn edges.
+
+================ ACCEPTANCE ================
+1. On a 400-node / 3,000-link documents graph after clicking "Tidy layout": clusters are compact with visible gaps between them, no overlapping nodes, no scattered halo of loose dots.
+2. Document-heavy graphs read as rings: documents near the centre, concepts around them, entities outside.
+3. Edges are clearly visible at rest, gradient-coloured, with arrows on directed relations; weak relations are dashed and fainter; hovering a node lights only its edges.
+4. Node size visibly follows connection count; each type has its own shape; leaves are quieter than hubs.
+5. Labels never overlap; zoomed out you see only cluster names plus a few hubs; zooming in reveals more; hovering reveals a node and its neighbours.
+6. Type presets, "Hide leaf nodes" and "Direct relationships only" work and update the view immediately.
+7. 50+ fps while rotating and zooming (check with ?fps=1); typecheck, build and pytest pass.
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-10-09T13:21:46+05:30.
+
+The user's current state is as follows:
+Active Document: c:\Users\logan\Downloads\nexmind\backend\.env (LANGUAGE_UNSPECIFIED)
+Cursor is on line: 1
+Other open documents:
+- c:\Users\logan\Downloads\nexmind\frontend\src\workspace\actions.ts (LANGUAGE_TYPESCRIPT)
+- c:\Users\logan\Downloads\nexmind\frontend\src\lib\store.ts (LANGUAGE_TYPESCRIPT)
+- c:\Users\logan\Downloads\nexmind\frontend\src\pages\Workspace.tsx (LANGUAGE_TSX)
+- c:\Users\logan\Downloads\nexmind\frontend\src\lib\types.ts (LANGUAGE_TYPESCRIPT)
+- c:\Users\logan\Downloads\nexmind\backend\nexmind\ingest\pipeline.py (LANGUAGE_PYTHON)
+Running terminal commands:
+- cd c:\Users\logan\Downloads\nexmind\frontend
+npm install
+npm run build
+npm ru... (in c:\Users\logan\Downloads\nexmind, running for 5m30s)
+- cd c:\Users\logan\Downloads\nexmind\backend
+python -m nexmind serve
+ (in c:\Users\logan\Downloads\nexmind\backend, running for 5m11s)
+</ADDITIONAL_METADATA>
+<USER_SETTINGS_CHANGE>
+The user changed setting `Model Selection` from None to Gemini 3.1 Pro (High). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.
+</USER_SETTINGS_CHANGE>

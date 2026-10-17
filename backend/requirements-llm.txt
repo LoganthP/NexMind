@@ -1,0 +1,5 @@
+# --- optional: pick the provider(s) you want (LangChain integrations) ---
+langchain-anthropic>=0.3     # NEXMIND_LLM_PROVIDER=anthropic  (+ ANTHROPIC_API_KEY)
+langchain-openai>=0.2        # NEXMIND_LLM_PROVIDER=openai     (+ OPENAI_API_KEY)
+langchain-ollama>=0.2        # NEXMIND_LLM_PROVIDER=ollama     (local models, no key)
+# sentence-transformers>=3.0 # optional dense embeddings: NEXMIND_EMBEDDINGS=sentence-transformers (downloads a model, ~90 MB)
