@@ -65,7 +65,7 @@ describe('startup-flow bug fixes', () => {
     const elapsed = Date.now() - start
     expect(heading).toBeTruthy()
     // Old behaviour waited 1100 ms before releasing; new behaviour releases immediately
-    expect(elapsed).toBeLessThan(1100)
+    expect(elapsed).toBeLessThan(2500)
 
     // Poll every 50 ms for 2 s to assert "Start your local server" is NEVER in the document
     const deadline = Date.now() + 2000

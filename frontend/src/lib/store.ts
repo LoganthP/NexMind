@@ -26,15 +26,59 @@ export const useSettings = create<SettingsState>((set, get) => ({
   },
 }))
 
+import { formatApiError } from './api'
+
 // ---------------------------------------------------------------- toasts
-export interface Toast { id: number; kind: 'info' | 'success' | 'error'; text: string }
-interface ToastState { items: Toast[]; push: (kind: Toast['kind'], text: string) => void; dismiss: (id: number) => void }
+export interface Toast {
+  id: number
+  kind: 'info' | 'success' | 'error'
+  text: string
+  baseText?: string
+  count?: number
+  timestamp?: number
+}
+interface ToastState {
+  items: Toast[]
+  push: (kind: Toast['kind'], text: string) => void
+  dismiss: (id: number) => void
+}
 let tid = 0
 export const useToasts = create<ToastState>((set, get) => ({
   items: [],
   push: (kind, text) => {
+    const formatted = formatApiError(text)
+    const now = Date.now()
+    const current = get().items
+    const existingIdx = current.findIndex(
+      (t) => (t.baseText || t.text) === formatted && t.kind === kind && now - (t.timestamp || 0) < 5000
+    )
+
+    if (existingIdx !== -1) {
+      const existing = current[existingIdx]
+      const count = (existing.count || 1) + 1
+      const updated: Toast = {
+        ...existing,
+        count,
+        timestamp: now,
+        text: `${formatted} x${count}`,
+      }
+      const nextItems = [...current]
+      nextItems[existingIdx] = updated
+      set({ items: nextItems.slice(-2) })
+      setTimeout(() => get().dismiss(existing.id), kind === 'error' ? 7000 : 3800)
+      return
+    }
+
     const id = ++tid
-    set({ items: [...get().items.slice(-3), { id, kind, text }] })
+    const item: Toast = {
+      id,
+      kind,
+      text: formatted,
+      baseText: formatted,
+      count: 1,
+      timestamp: now,
+    }
+    set({ items: [...current.slice(-1), item] })
     setTimeout(() => get().dismiss(id), kind === 'error' ? 7000 : 3800)
   },
   dismiss: (id) => set({ items: get().items.filter((t) => t.id !== id) }),
@@ -42,7 +86,7 @@ export const useToasts = create<ToastState>((set, get) => ({
 export const toast = {
   info: (t: string) => useToasts.getState().push('info', t),
   success: (t: string) => useToasts.getState().push('success', t),
-  error: (t: string) => useToasts.getState().push('error', t),
+  error: (t: unknown) => useToasts.getState().push('error', typeof t === 'string' ? t : (t as any)),
 }
 
 // ---------------------------------------------------------------- workspace view state

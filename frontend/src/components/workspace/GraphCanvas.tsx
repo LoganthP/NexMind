@@ -25,8 +25,16 @@ export function GraphCanvas() {
           onEdgeHover: (id) => patch({ hoverEdgeId: id, hoverPos: id ? eng.current?.getPointer() ?? null : null }),
           onEdgeClick: (id) => selectEdge(id),
           onBackground: () => {
-            clearAll()
-            eng.current?.clearFocusState()
+            const v = useView.getState()
+            const hasResultPanel = Boolean(v.impact || v.trace || v.flowProc)
+            engine.setSelected(null)
+            engine.setFocus(null)
+            engine.releasePivot()
+            if (hasResultPanel) {
+              patch({ selectedId: null, selectedEdgeId: null, drawerOpen: false, focus: null })
+            } else {
+              clearAll()
+            }
           },
           onLowFps: () => { toast.info('Switched to performance mode to keep things smooth'); set({ perf: true }) },
         },
@@ -45,7 +53,9 @@ export function GraphCanvas() {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         clearAll()
-        eng.current?.clearFocusState()
+        eng.current?.setSelected(null)
+        eng.current?.setFocus(null)
+        eng.current?.releasePivot()
       }
     }
     window.addEventListener('keydown', onKey)
@@ -66,5 +76,5 @@ export function GraphCanvas() {
       </div>
     )
   }
-  return <div ref={ref} className="absolute inset-0 touch-none" onDoubleClick={() => clearAll()} aria-label="3D knowledge graph" role="application" />
+  return <div ref={ref} className="absolute inset-0 touch-none" onDoubleClick={() => { clearAll(); eng.current?.restoreView() }} aria-label="3D knowledge graph" role="application" />
 }

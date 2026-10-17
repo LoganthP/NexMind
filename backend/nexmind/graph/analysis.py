@@ -4,6 +4,7 @@ from __future__ import annotations
 import colorsys
 import hashlib
 import math
+import re
 from collections import Counter, defaultdict, deque
 from typing import Any
 
@@ -110,16 +111,33 @@ def label_clusters(nodes: dict[str, dict], assign: dict[str, int]) -> list[dict]
         files = [m["label"] for m in top if m["type"] in ("File", "Document")][:1]
         code_like = types["File"] + types["Function"] + types["Method"] + types["Class"]
         doc_like = types["Document"] + types["Section"] + types["Concept"] + types["Entity"]
+        def _clean_cluster_label(parts: list[str]) -> str:
+            res: list[str] = []
+            seen_words: set[str] = set()
+            for p in parts:
+                p_clean = p.strip()
+                if not p_clean:
+                    continue
+                words = re.findall(r"[A-Za-z0-9]+", p_clean.lower())
+                sig_words = [w for w in words if len(w) > 2]
+                if sig_words and all(w in seen_words for w in sig_words):
+                    continue
+                for w in sig_words:
+                    seen_words.add(w)
+                res.append(p_clean)
+            return " · ".join(res) if res else (parts[0] if parts else "Module")
+
         if cid == 0:
             label = "Loose ends"
         elif doc_like > code_like and concepts:
-            label = " · ".join(concepts)
+            label = _clean_cluster_label(concepts)
         elif dirs:
-            label = dirs.most_common(1)[0][0] + (f" · {syms[0]}" if syms else "")
+            dir_name = dirs.most_common(1)[0][0]
+            label = _clean_cluster_label([dir_name] + ([syms[0]] if syms else []))
         elif syms:
-            label = " · ".join(syms)
+            label = _clean_cluster_label(syms)
         elif concepts:
-            label = " · ".join(concepts)
+            label = _clean_cluster_label(concepts)
         else:
             label = (files or [top[0]["label"]])[0]
         desc = ", ".join(f"{v} {k.lower()}{'s' if v != 1 else ''}" for k, v in types.most_common(4))

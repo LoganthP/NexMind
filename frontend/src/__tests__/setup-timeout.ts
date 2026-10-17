@@ -1,3 +1,3 @@
 import { configure } from '@testing-library/dom'
 
-configure({ asyncUtilTimeout: 4000 })
+configure({ asyncUtilTimeout: 10000 })

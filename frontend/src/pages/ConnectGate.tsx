@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import { ArrowLeft, Check, ChevronDown, Plug } from 'lucide-react'
 import { Aurora, CopyBlock, Logo } from '@/components/ui'
-import { COMMANDS, PIP_COMMAND, detectOS, type OS } from '@/lib/os'
+import { COMMANDS, PIP_COMMAND, detectOS, getUniversalConnectCommands, type OS } from '@/lib/os'
 import { useServer } from '@/lib/server'
 import { toast } from '@/lib/store'
 
@@ -22,6 +22,7 @@ export default function ConnectGate({ connected = false }: { connected?: boolean
   const [busy, setBusy] = useState(false)
   useEffect(() => setOs(detectOS()), [])
   const cmd = COMMANDS[os]
+  const { primary: connectCmd } = getUniversalConnectCommands(os)
   const online = connected || status === 'online'
 
   const connectCustom = async () => {
@@ -55,9 +56,13 @@ export default function ConnectGate({ connected = false }: { connected?: boolean
                   ))}
                 </div>
               </div>
-              <p className="mb-2 mt-1 text-sm text-mist">Open {cmd.shell} in your <span className="mono text-ink">backend</span> folder first:</p>
+              <p className="mb-2 mt-1 text-sm text-mist">Run this from your project folder — no install needed:</p>
               <div className="space-y-2.5">
-                <CopyBlock label={cmd.shell} command={cmd.first} />
+                <CopyBlock label={`${cmd.shell} · one-liner`} command={connectCmd} />
+              </div>
+              <p className="my-2 text-center text-xs text-mist">or, if you want to run the server yourself</p>
+              <div className="space-y-2">
+                <CopyBlock label={`${cmd.shell} · cd into backend first`} command={cmd.first} />
                 <CopyBlock label={`${cmd.shell} · first run installs everything`} command={cmd.run} />
               </div>
               <p className="my-2 text-center text-xs text-mist">or, if you installed it as a command</p>

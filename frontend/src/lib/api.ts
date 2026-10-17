@@ -22,7 +22,71 @@ export function wsBase(base = getApiBase()): string {
 
 export class ApiError extends Error {
   status: number
-  constructor(message: string, status = 0) { super(message); this.status = status }
+  rawDetail?: unknown
+  constructor(message: string, status = 0, rawDetail?: unknown) {
+    super(message)
+    this.status = status
+    this.rawDetail = rawDetail
+  }
+}
+
+export function formatApiError(e: unknown): string {
+  if (!e) return 'An unexpected error occurred.'
+
+  const status = typeof (e as any)?.status === 'number' ? (e as any).status : undefined
+
+  if (status === 413) {
+    return 'That file is too large.'
+  }
+  if (status !== undefined && status >= 500 && status < 600) {
+    return 'The server hit a problem. Try again; details are in the server terminal.'
+  }
+
+  let rawDetail: any = (e as any)?.rawDetail ?? (e as any)?.detail ?? (e as any)?.message ?? e
+  if (typeof rawDetail === 'string') {
+    const trimmed = rawDetail.trim()
+    if ((trimmed.startsWith('[') && trimmed.endsWith(']')) || (trimmed.startsWith('{') && trimmed.endsWith('}'))) {
+      try {
+        rawDetail = JSON.parse(trimmed)
+      } catch { /* keep as string */ }
+    }
+  }
+
+  // 1. FastAPI validation array [{loc, msg, ...}]
+  if (Array.isArray(rawDetail)) {
+    const hasKind = rawDetail.some((item) => Array.isArray(item?.loc) && item.loc.includes('kind'))
+    if (hasKind) {
+      return 'The workspace type is not supported by this server version. Restart the backend after updating.'
+    }
+    const first = rawDetail[0]
+    if (first && typeof first === 'object') {
+      const field = Array.isArray(first.loc) && first.loc.length > 0 ? String(first.loc[first.loc.length - 1]) : 'field'
+      const msg = first.msg ? String(first.msg) : 'Invalid value'
+      return `${field}: ${msg}`
+    }
+  }
+
+  // 2. detail is an object
+  if (rawDetail && typeof rawDetail === 'object' && !(rawDetail instanceof Error)) {
+    if (typeof (rawDetail as any).detail === 'string') {
+      return (rawDetail as any).detail
+    }
+    if (typeof (rawDetail as any).message === 'string') {
+      return (rawDetail as any).message
+    }
+    const entries = Object.entries(rawDetail)
+      .filter(([k, v]) => typeof v === 'string' || typeof v === 'number')
+      .map(([k, v]) => `${k}: ${v}`)
+    if (entries.length > 0) return entries.join(', ')
+    return 'The server rejected this request.'
+  }
+
+  const str = String(rawDetail)
+  if (/Failed to fetch|NetworkError|Cannot reach/i.test(str)) {
+    return 'Cannot reach the NexMind server. Is it running?'
+  }
+
+  return str.replace(/^Error:\s*/i, '').replace(/^\d{3}\s+/, '').trim() || 'An error occurred.'
 }
 
 async function request<T>(path: string, init: RequestInit = {}, base = getApiBase(), timeoutMs = 30000): Promise<T> {
@@ -34,11 +98,13 @@ async function request<T>(path: string, init: RequestInit = {}, base = getApiBas
     const res = await fetch(base + path, { ...init, headers, signal: init.signal ?? ctl.signal })
     if (!res.ok) {
       let detail = `${res.status} ${res.statusText}`
+      let raw: any = undefined
       try {
         const j = await res.json()
+        raw = j.detail ?? j
         detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail ?? j)
       } catch { /* not json */ }
-      throw new ApiError(detail, res.status)
+      throw new ApiError(detail, res.status, raw)
     }
     if (res.status === 204) return undefined as T
     return (await res.json()) as T
@@ -83,7 +149,14 @@ export const api = {
   ingestGit: (id: string, url: string, token?: string, branch?: string) =>
     request<{ job_id: string }>(`/api/workspaces/${id}/ingest/git`, { method: 'POST', body: j({ url, token: token || undefined, branch: branch || undefined }) }),
   ingestLocal: (id: string, path: string) => request<{ job_id: string }>(`/api/workspaces/${id}/ingest/local`, { method: 'POST', body: j({ path }) }),
-  fsList: (path?: string) => request<FsListing>(`/api/fs/list${q({ path })}`),
+  fsList: (path?: string, files = 1) => request<FsListing>(`/api/fs/list${q({ path, files })}`),
+  fsCheck: (path: string) => request<import('./types').FsCheckResult>(`/api/fs/check${q({ path })}`),
+  connect: (path: string, name?: string, watch = true) =>
+    request<{ workspace_id: string; job_id: string; name: string; url: string; reused: boolean }>('/api/connect', { method: 'POST', body: j({ path, name, watch }) }),
+  connectSessions: (since = 0) =>
+    request<{ now: number; sessions: { workspace_id: string; name: string; path: string; job_id: string; created_at: number; reused: boolean }[] }>(`/api/connect/sessions${q({ since })}`),
+  setSourceWatch: (id: string, sid: string, enabled: boolean) =>
+    request<{ ok: boolean; source_id: string; watch: number }>(`/api/workspaces/${id}/sources/${sid}/watch`, { method: 'POST', body: j({ enabled }) }),
   job: (id: string) => request<JobInfo>(`/api/jobs/${id}`),
   rawUrl: (wsId: string, sid: string, path: string) => `${getApiBase()}/api/workspaces/${wsId}/sources/${sid}/raw${q({ path })}`,
 

@@ -21,7 +21,7 @@ router = APIRouter(prefix="/api", tags=["workspaces"])
 class WorkspaceIn(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     description: str = Field(default="", max_length=500)
-    kind: Literal['code', 'docs'] = 'code'
+    kind: Literal['code', 'docs', 'live'] = 'code'
 
 
 class WorkspacePatch(BaseModel):
@@ -74,11 +74,14 @@ def _ws_out(ws: dict) -> dict:
 
 @router.post("/workspaces", status_code=201)
 def create_workspace(body: WorkspaceIn) -> dict:
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(422, "Workspace name cannot be empty")
     ws_id = new_id("ws_")
     t = now()
     db.execute(
         "INSERT INTO workspaces(id,name,description,created_at,updated_at,status,stats,kind) VALUES(?,?,?,?,?,?,?,?)",
-        (ws_id, body.name.strip(), body.description.strip(), t, t, "empty", "{}", body.kind),
+        (ws_id, name, body.description.strip(), t, t, "empty", "{}", body.kind),
     )
     ws_dir(ws_id).mkdir(parents=True, exist_ok=True)
     return _ws_out(get_ws(ws_id))
@@ -97,7 +100,13 @@ def read_workspace(ws_id: str) -> dict:
 @router.patch("/workspaces/{ws_id}")
 def patch_workspace(ws_id: str, body: WorkspacePatch) -> dict:
     ws = get_ws(ws_id)
-    db.execute("UPDATE workspaces SET name=?, description=?, updated_at=? WHERE id=?", (body.name or ws["name"], body.description if body.description is not None else ws["description"], now(), ws_id))
+    if body.name is not None:
+        new_name = body.name.strip()
+        if not new_name:
+            raise HTTPException(422, "Workspace name cannot be empty")
+    else:
+        new_name = ws["name"]
+    db.execute("UPDATE workspaces SET name=?, description=?, updated_at=? WHERE id=?", (new_name, body.description if body.description is not None else ws["description"], now(), ws_id))
     return _ws_out(get_ws(ws_id))
 
 
@@ -177,10 +186,10 @@ async def _save_upload(up: UploadFile, dest: Path) -> int:
     return size
 
 
-def _register_source(ws_id: str, source_id: str, name: str, kind: str, origin: str, path: Path, size: int = 0) -> None:
+def _register_source(ws_id: str, source_id: str, name: str, kind: str, origin: str, path: Path, size: int = 0, watch: int = 0) -> None:
     db.execute(
-        "INSERT INTO sources(id,workspace_id,name,kind,origin,path,size,file_count,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-        (source_id, ws_id, name, kind, origin, str(path), size, 0, now()),
+        "INSERT INTO sources(id,workspace_id,name,kind,origin,path,size,file_count,created_at,watch) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (source_id, ws_id, name, kind, origin, str(path), size, 0, now(), watch),
     )
 
 
@@ -229,6 +238,8 @@ async def ingest(ws_id: str, files: list[UploadFile] = File(default=[]), git_url
     """Upload PDFs / DOCX / Markdown / code files / .zip / .tar.gz archives and/or a public git URL.
     The graph is (re)built in the background; subscribe to /ws/workspaces/{id} for live progress."""
     ws = get_ws(ws_id)
+    if ws.get("kind") == "live":
+        raise HTTPException(400, "Live workspaces are connected from a folder.")
     if ws.get("kind") == "docs" and git_url:
         raise HTTPException(400, "Document workspaces take PDFs, Word, Markdown, text and zip files.")
     files = [f for f in files if f.filename]
@@ -294,6 +305,8 @@ async def ingest(ws_id: str, files: list[UploadFile] = File(default=[]), git_url
 @router.post("/workspaces/{ws_id}/ingest/git", status_code=202)
 def ingest_git(ws_id: str, body: GitIn) -> dict:
     ws = get_ws(ws_id)
+    if ws.get("kind") == "live":
+        raise HTTPException(400, "Live workspaces are connected from a folder.")
     if ws.get("kind") == "docs":
         raise HTTPException(400, "Document workspaces take PDFs, Word, Markdown, text and zip files.")
     try:
@@ -337,32 +350,227 @@ def ingest_local(ws_id: str, body: LocalIn, request: Request) -> dict:
 
 
 @router.get("/fs/list", tags=["system"])
-def fs_list(request: Request, path: str | None = None) -> dict:
-    """Folder browser for the 'Local folder' picker (loopback only, directories only)."""
+def fs_list(request: Request, path: str | None = None, files: int = 1) -> dict:
+    """Folder browser for the 'Local folder' picker (loopback only)."""
     require_local(request)
     import os
     import string
 
     home = Path.home()
-    roots = [{"name": "Home", "path": str(home)}, {"name": "Current folder", "path": str(Path.cwd())}]
+    p = Path(path).expanduser() if path else home
+    try:
+        p = p.resolve()
+    except PermissionError as e:
+        raise HTTPException(400, "Cannot open this folder (permission denied)") from e
+    except OSError as e:
+        raise HTTPException(400, f"Cannot open folder: {e}") from e
+
+    if not p.exists() or not p.is_dir():
+        raise HTTPException(400, f"Cannot open folder: {p} is not a directory")
+
+    roots: list[dict[str, str]] = []
+    if home.exists():
+        roots.append({"name": "Home", "path": str(home)})
+    desktop = home / "Desktop"
+    if desktop.exists():
+        roots.append({"name": "Desktop", "path": str(desktop)})
+    docs = home / "Documents"
+    if docs.exists():
+        roots.append({"name": "Documents", "path": str(docs)})
+    downloads = home / "Downloads"
+    if downloads.exists():
+        roots.append({"name": "Downloads", "path": str(downloads)})
+    roots.append({"name": "Current folder", "path": str(Path.cwd())})
     if os.name == "nt":
         roots += [{"name": f"{d}:\\", "path": f"{d}:\\"} for d in string.ascii_uppercase if Path(f"{d}:\\").exists()]
     else:
         roots.append({"name": "/", "path": "/"})
-    p = Path(path).expanduser() if path else home
+
+    parent = str(p.parent) if p.parent != p else None
+
+    # Crumbs
+    crumbs: list[dict[str, str]] = []
+    curr = p
+    chain: list[Path] = []
+    while True:
+        chain.append(curr)
+        if curr.parent == curr:
+            break
+        curr = curr.parent
+    for part in reversed(chain):
+        crumbs.append({"name": part.name or str(part), "path": str(part)})
+
+    PROJECT_MARKERS = {
+        ".git", "package.json", "pyproject.toml", "requirements.txt",
+        "pom.xml", "build.gradle", "go.mod", "Cargo.toml", "composer.json"
+    }
+
+    def _get_markers(folder: Path) -> list[str]:
+        m: list[str] = []
+        try:
+            for sub in folder.iterdir():
+                if sub.name in PROJECT_MARKERS or sub.name.endswith(".sln"):
+                    m.append(sub.name)
+            if not m:
+                for sub in folder.iterdir():
+                    if sub.is_dir() and not sub.name.startswith("."):
+                        for item in sub.iterdir():
+                            if item.name in PROJECT_MARKERS:
+                                m.append(item.name)
+                            elif item.name == "__init__.py":
+                                m.append("__init__.py")
+            if not m:
+                if any(folder.glob("*.py")) or any(folder.glob("*/*.py")):
+                    m.append("python")
+                if any(folder.glob("*.js")) or any(folder.glob("*/*.js")) or any(folder.glob("*.ts")) or any(folder.glob("*/*.ts")):
+                    m.append("javascript")
+        except (OSError, PermissionError):
+            pass
+        return sorted(list(set(m)))
+
+    dirs: list[dict[str, Any]] = []
+    file_entries: list[dict[str, Any]] = []
+    try:
+        for child in p.iterdir():
+            if child.name.startswith(".") and child.name != ".github":
+                continue
+            try:
+                if child.is_dir():
+                    markers = _get_markers(child)
+                    dirs.append({
+                        "name": child.name,
+                        "path": str(child),
+                        "kind": "dir",
+                        "is_project": bool(markers),
+                        "markers": markers if markers else None,
+                    })
+                elif files and child.is_file():
+                    sz = 0
+                    try:
+                        sz = child.stat().st_size
+                    except OSError:
+                        pass
+                    file_entries.append({
+                        "name": child.name,
+                        "path": str(child),
+                        "kind": "file",
+                        "size": sz,
+                    })
+            except (OSError, PermissionError):
+                continue
+    except PermissionError as e:
+        raise HTTPException(400, "Cannot open this folder (permission denied)") from e
+    except OSError as e:
+        raise HTTPException(400, f"Cannot open folder: {e}") from e
+
+    dirs.sort(key=lambda d: d["name"].lower())
+    file_entries.sort(key=lambda f: f["name"].lower())
+    all_entries = dirs + file_entries
+    truncated = len(all_entries) > 400
+    return {
+        "path": str(p),
+        "parent": parent,
+        "crumbs": crumbs,
+        "roots": roots,
+        "entries": all_entries[:400],
+        "truncated": truncated,
+    }
+
+
+@router.get("/fs/check", tags=["system"])
+def fs_check(request: Request, path: str | None = None) -> dict:
+    require_local(request)
+    from fastapi.responses import JSONResponse
+    from ..ingest.files import walk_source
+
+    if not path or not path.strip():
+        return JSONResponse(status_code=400, content={"ok": False, "exists": False, "is_dir": False, "readable": False, "markers": [], "supported_files": 0, "has_code": False, "has_docs": False, "message": "Path is required", "detail": "Path is required"})
+
+    p = Path(path.strip().strip('"')).expanduser()
     try:
         p = p.resolve()
-        entries = []
-        for child in sorted(p.iterdir(), key=lambda c: c.name.lower()):
-            try:
-                if child.is_dir() and not child.name.startswith("."):
-                    entries.append({"name": child.name, "path": str(child)})
-            except OSError:
-                continue
-    except (OSError, PermissionError) as e:
-        raise HTTPException(400, f"Cannot open folder: {e}") from e
-    parent = str(p.parent) if p.parent != p else None
-    return {"path": str(p), "parent": parent, "entries": entries[:500], "roots": roots}
+    except OSError as e:
+        return JSONResponse(status_code=400, content={"ok": False, "exists": False, "is_dir": False, "readable": False, "markers": [], "supported_files": 0, "has_code": False, "has_docs": False, "message": f"Invalid path: {e}", "detail": f"Invalid path: {e}"})
+
+    if not p.exists() or not p.is_dir():
+        return JSONResponse(status_code=400, content={"ok": False, "exists": False, "is_dir": False, "readable": False, "markers": [], "supported_files": 0, "has_code": False, "has_docs": False, "message": f"Folder not found: {p}", "detail": f"Folder not found: {p}"})
+
+    if p == Path(p.anchor):
+        return JSONResponse(status_code=400, content={"ok": False, "exists": True, "is_dir": True, "readable": True, "markers": [], "supported_files": 0, "has_code": False, "has_docs": False, "message": "Choose a project folder, not a drive root", "detail": "Choose a project folder, not a drive root"})
+
+    PROJECT_MARKERS = {
+        ".git", "package.json", "pyproject.toml", "requirements.txt",
+        "pom.xml", "build.gradle", "go.mod", "Cargo.toml", "composer.json"
+    }
+    markers: list[str] = []
+    try:
+        for item in p.iterdir():
+            if item.name in PROJECT_MARKERS or item.name.endswith(".sln"):
+                markers.append(item.name)
+        if not markers:
+            for sub in p.iterdir():
+                if sub.is_dir() and not sub.name.startswith("."):
+                    for item in sub.iterdir():
+                        if item.name in PROJECT_MARKERS:
+                            markers.append(item.name)
+                        elif item.name == "__init__.py":
+                            markers.append("__init__.py")
+        if not markers:
+            if any(p.glob("*.py")) or any(p.glob("*/*.py")):
+                markers.append("python")
+            if any(p.glob("*.js")) or any(p.glob("*/*.js")):
+                markers.append("javascript")
+    except PermissionError as e:
+        return JSONResponse(status_code=400, content={"ok": False, "exists": True, "is_dir": True, "readable": False, "markers": [], "supported_files": 0, "has_code": False, "has_docs": False, "message": "Cannot open this folder (permission denied)", "detail": "Cannot open this folder (permission denied)"})
+    except OSError as e:
+        return JSONResponse(status_code=400, content={"ok": False, "exists": True, "is_dir": True, "readable": False, "markers": [], "supported_files": 0, "has_code": False, "has_docs": False, "message": str(e), "detail": str(e)})
+
+    supported_files = 0
+    has_code = False
+    has_docs = False
+    try:
+        for fe in walk_source(p):
+            supported_files += 1
+            if fe.category == "code":
+                has_code = True
+            elif fe.category == "doc":
+                has_docs = True
+            if supported_files >= 5000:
+                break
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"ok": False, "exists": True, "is_dir": True, "readable": False, "markers": markers, "supported_files": supported_files, "has_code": has_code, "has_docs": has_docs, "message": f"Cannot read files: {e}", "detail": f"Cannot read files: {e}"})
+
+    project_type = ""
+    if any("py" in m or "requirements" in m or "__init__" in m for m in markers):
+        project_type = "Python project"
+    elif any("package.json" in m or "javascript" in m for m in markers):
+        project_type = "Node / TypeScript project"
+    elif any("Cargo" in m for m in markers):
+        project_type = "Rust project"
+    elif any("go.mod" in m for m in markers):
+        project_type = "Go project"
+    elif any("pom.xml" in m or "gradle" in m for m in markers):
+        project_type = "Java project"
+
+    msg_parts = [f"≈ {supported_files} supported files"]
+    if project_type:
+        msg_parts.append(project_type)
+    elif has_code:
+        msg_parts.append("codebase")
+    elif has_docs:
+        msg_parts.append("documents")
+
+    return {
+        "ok": True,
+        "exists": True,
+        "is_dir": True,
+        "readable": True,
+        "markers": sorted(markers),
+        "supported_files": supported_files,
+        "has_code": has_code,
+        "has_docs": has_docs,
+        "message": " · ".join(msg_parts),
+    }
 
 
 @router.post("/workspaces/{ws_id}/rebuild", status_code=202)

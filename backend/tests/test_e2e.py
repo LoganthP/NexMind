@@ -378,3 +378,153 @@ def test_explain_and_relayout(client, ws):
     assert relayout_res["nodes"] == len(g["nodes"])
 
 
+def test_live_workspace_and_connect(client, monkeypatch):
+    # 1. kind 'live' accepted and rejects git / upload
+    r = client.post("/api/workspaces", json={"name": "Live Test WS", "kind": "live"})
+    assert r.status_code == 201
+    live_ws_id = r.json()["id"]
+    assert r.json()["kind"] == "live"
+
+    # git into live -> 400 with string detail
+    r_git = client.post(f"/api/workspaces/{live_ws_id}/ingest/git", json={"url": "https://github.com/foo/bar"})
+    assert r_git.status_code == 400
+    assert "Live workspaces are connected from a folder." in r_git.json()["detail"]
+    assert isinstance(r_git.json()["detail"], str)
+
+    # upload into live -> 400 with string detail
+    r_up = client.post(f"/api/workspaces/{live_ws_id}/ingest", files=[("files", ("test.zip", b"fake", "application/zip"))])
+    assert r_up.status_code == 400
+    assert "Live workspaces are connected from a folder." in r_up.json()["detail"]
+    assert isinstance(r_up.json()["detail"], str)
+
+    # 2. /api/fs/list with files=1 returns dirs then files and flags sample_project as is_project
+    r_fs = client.get(f"/api/fs/list?path={SAMPLE.parent}&files=1")
+    assert r_fs.status_code == 200
+    fs_data = r_fs.json()
+    entries = fs_data["entries"]
+    assert len(entries) > 0
+    # verify dirs first
+    seen_file = False
+    for e in entries:
+        if e["kind"] == "file":
+            seen_file = True
+        elif e["kind"] == "dir":
+            assert not seen_file, "Directories must come before files in fs/list"
+    sample_entry = next((e for e in entries if e["name"] == SAMPLE.name), None)
+    assert sample_entry is not None
+    assert sample_entry["is_project"] is True
+    assert sample_entry["markers"] is not None and len(sample_entry["markers"]) > 0
+
+    # 3. /api/fs/check returns supported_files >= 8 for sample project and friendly 400/ok=false for "/" and missing path
+    r_check = client.get(f"/api/fs/check?path={SAMPLE}")
+    assert r_check.status_code == 200
+    check_data = r_check.json()
+    assert check_data["ok"] is True
+    assert check_data["supported_files"] >= 8
+    assert check_data["has_code"] is True
+
+    r_root = client.get("/api/fs/check?path=/")
+    assert r_root.status_code == 400 or r_root.json().get("ok") is False
+    assert "drive root" in str(r_root.json()).lower() or "not found" in str(r_root.json()).lower()
+
+    r_missing = client.get("/api/fs/check?path=/nonexistent_directory_123456")
+    assert r_missing.status_code == 400 or r_missing.json().get("ok") is False
+
+    # 4. /api/connect creates and reuses
+    r_conn1 = client.post("/api/connect", json={"path": str(SAMPLE), "name": "Live Sample Project"})
+    assert r_conn1.status_code == 200
+    c1 = r_conn1.json()
+    assert c1["reused"] is False
+    assert c1["name"] == "Live Sample Project"
+    ws1_id = c1["workspace_id"]
+    wait_job(client, c1["job_id"])
+
+    # verify kind 'live' behaves like code
+    g = client.get(f"/api/workspaces/{ws1_id}/graph").json()
+    types = {n["type"] for n in g["nodes"]}
+    assert "Function" in types or "Class" in types or "File" in types
+
+    # second call with same resolved path reuses
+    r_conn2 = client.post("/api/connect", json={"path": str(SAMPLE)})
+    assert r_conn2.status_code == 200
+    c2 = r_conn2.json()
+    assert c2["reused"] is True
+    assert c2["workspace_id"] == ws1_id
+
+    # 5. /api/connect/sessions returns the new session
+    r_sess = client.get("/api/connect/sessions")
+    assert r_sess.status_code == 200
+    sess_data = r_sess.json()
+    assert "now" in sess_data
+    sessions = sess_data["sessions"]
+    matched = [s for s in sessions if s["workspace_id"] == ws1_id]
+    assert len(matched) >= 1
+    assert matched[-1]["path"] == str(SAMPLE.resolve())
+
+    # 6. watcher triggers a second rebuild after a file is added (use NEXMIND_WATCH_INTERVAL=0.2)
+    from nexmind.watcher import watcher
+    monkeypatch.setenv("NEXMIND_WATCH_INTERVAL", "0.2")
+    monkeypatch.setenv("NEXMIND_WATCH_SETTLE", "0.4")
+    watcher.wake()
+
+    # Create a small temp watched workspace
+    watch_dir = Path(tempfile.mkdtemp(prefix="nexmind-watch-test-"))
+    try:
+        (watch_dir / "app.py").write_text("def hello():\n    return 'world'\n", encoding="utf-8")
+        r_cw = client.post("/api/connect", json={"path": str(watch_dir), "name": "Watcher Test", "watch": True})
+        assert r_cw.status_code == 200
+        w_info = r_cw.json()
+        watch_ws_id = w_info["workspace_id"]
+        wait_job(client, w_info["job_id"])
+
+        initial_jobs = client.get(f"/api/workspaces/{watch_ws_id}/jobs").json()
+        assert len(initial_jobs) >= 1
+
+        # Add a new file to trigger watcher
+        time.sleep(0.3)
+        (watch_dir / "second.py").write_text("def added():\n    return 42\n", encoding="utf-8")
+
+        # Wait for watcher to detect and submit rebuild job
+        deadline = time.time() + 6.0
+        rebuild_found = False
+        while time.time() < deadline:
+            jobs_now = client.get(f"/api/workspaces/{watch_ws_id}/jobs").json()
+            rebuilds = [j for j in jobs_now if j["kind"] == "rebuild"]
+            if rebuilds:
+                rebuild_found = True
+                wait_job(client, rebuilds[0]["id"])
+                break
+            time.sleep(0.2)
+        assert rebuild_found, "Watcher did not trigger a rebuild after file addition"
+    finally:
+        try:
+            client.delete(f"/api/workspaces/{ws1_id}")
+        except Exception:
+            pass
+        try:
+            client.delete(f"/api/workspaces/{watch_ws_id}")
+        except Exception:
+            pass
+        shutil.rmtree(watch_dir, ignore_errors=True)
+
+
+
+
+def test_connect_script_endpoint(client):
+    r = client.get('/connect.py')
+    assert r.status_code == 200, r.text
+    ct = r.headers.get('content-type', '')
+    assert 'text/plain' in ct, f'unexpected content-type: {ct}'
+    script = r.text
+    compile(script, '<connect.py>', 'exec')
+    assert 'http://testserver' in script, 'base URL not injected into script'
+    assert 'def main(' in script, 'no main() in script'
+    assert 'urllib.request' in script
+    assert 'import json' in script
+
+
+def test_connect_script_no_third_party(client):
+    r = client.get('/connect.py')
+    assert r.status_code == 200
+    for lib in ('requests', 'httpx', 'aiohttp', 'flask', 'fastapi', 'pydantic'):
+        assert 'import ' + lib not in r.text

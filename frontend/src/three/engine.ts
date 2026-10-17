@@ -5,6 +5,7 @@ import type { Cluster, GLink, GNode } from '@/lib/types'
 import { EdgeRenderer, type EdgeRendererColors } from './edges'
 import { relax } from './relax'
 import { pastelClusterColor } from './labels'
+import { releasePivot, clampTarget, CameraGuard, shouldRunMove, shouldRestore, type Vec3 } from './cameraPivot'
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type FG = any
@@ -203,6 +204,11 @@ export class BrainEngine {
   private pathCancel: (() => void) | null = null
   private ro: ResizeObserver
   private onMove: (e: PointerEvent) => void
+  private onUserActivity: () => void
+  private guard = new CameraGuard()
+  // Camera position+target saved just before the last programmatic flyTo.
+  // Used to restore the view when the user deselects a node without navigating away.
+  private viewMemory: { pos: THREE.Vector3; target: THREE.Vector3 } | null = null
 
   private edgeRenderer: EdgeRenderer
   private isRelaxed = false
@@ -275,16 +281,31 @@ export class BrainEngine {
     }
     const controls = fg.controls()
     if (controls) {
-      controls.enableDamping = true; controls.dampingFactor = 0.08
-      controls.autoRotate = this.opts.autoRotate; controls.autoRotateSpeed = 0.35
-      controls.minDistance = 20; controls.maxDistance = 2600
+      controls.zoomToCursor = true
+      controls.screenSpacePanning = true
+      controls.enablePan = true
+      controls.panSpeed = 0.9
+      controls.zoomSpeed = 0.9
+      controls.enableDamping = true
+      controls.dampingFactor = 0.1
+      controls.autoRotate = this.opts.autoRotate
+      controls.autoRotateSpeed = 0.35
+      controls.minDistance = 15
+      controls.maxDistance = Math.max(2600, this.lastBoundingRadius * 6)
+
+      controls.addEventListener?.('change', () => {
+        if (controls.target) {
+          const clamped = clampTarget(controls.target, this.lastCenter, this.lastBoundingRadius)
+          controls.target.set(clamped.x, clamped.y, clamped.z)
+        }
+      })
+
       controls.addEventListener?.('start', () => {
-        this.isInteracting = true
-        this.userMovedCamera = true
-        this.pauseRotate()
+        this.handleUserInteraction()
       })
       controls.addEventListener?.('end', () => {
         this.isInteracting = false
+        this.pauseRotate()
       })
     }
     if (!low) {
@@ -296,6 +317,9 @@ export class BrainEngine {
     this.addDust()
     this.onMove = (e) => { const r = el.getBoundingClientRect(); this.pointer = { x: e.clientX - r.left, y: e.clientY - r.top } }
     el.addEventListener('pointermove', this.onMove)
+    this.onUserActivity = () => this.handleUserInteraction()
+    el.addEventListener('wheel', this.onUserActivity, { passive: true })
+    el.addEventListener('pointerdown', this.onUserActivity)
     this.ro = new ResizeObserver(() => this.resize())
     this.ro.observe(el)
     this.resize()
@@ -404,10 +428,11 @@ export class BrainEngine {
     this.commit()
     this.updateEdgeBase()
     this.rebuildDecor()
+    this.updateGraphBounds()
 
     // Reset emphasis so graph rest state is clear
     this.applyFocus(null)
-    this.frameGraph()
+    this.frameGraph(700, { force: false })
   }
 
   /** Streaming growth: each batch blooms in at the server-computed position. */
@@ -419,6 +444,7 @@ export class BrainEngine {
     this.updateHubThreshold()
     this.commit()
     this.updateEdgeBase()
+    this.updateGraphBounds()
     this.scheduleFit(700)
   }
 
@@ -467,6 +493,10 @@ export class BrainEngine {
     this.selectedId = null
     this.focus = null
     this.userMovedCamera = false
+    this.viewMemory = null
+    this.guard.cancelAll()
+    if (this.fitTimer) { clearTimeout(this.fitTimer); this.fitTimer = undefined }
+    if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = undefined }
     if (this.hoverInTimer) { clearTimeout(this.hoverInTimer); this.hoverInTimer = null }
     if (this.hoverOutTimer) { clearTimeout(this.hoverOutTimer); this.hoverOutTimer = null }
     this.applyFocus(null)
@@ -479,7 +509,7 @@ export class BrainEngine {
     this.edgeRenderer.updateBase([], new Map(), new Map(), () => false, this.colorConfig())
     this.edgeRenderer.updateHighlight(null, new Map(), new Map(), this.colorConfig())
     this.fg.graphData({ nodes: [], links: [] })
-    if (resetCamera) this.fg.cameraPosition({ x: 0, y: 60, z: 520 })
+    if (resetCamera) this.moveCamera('clear', { x: 0, y: 60, z: 520 }, { x: 0, y: 0, z: 0 }, 0, { force: true })
   }
 
   private register(n: GNode, born: number) {
@@ -611,11 +641,33 @@ export class BrainEngine {
 
   setSelected(id: string | null) {
     this.selectedId = id
+    if (id === null) {
+      // Cancel any in-flight programmatic camera move so it cannot re-set target
+      this.guard.cancelAll()
+      this.restoreViewOrReleasePivot()
+      this.pauseRotate()
+    } else {
+      // Mark that we are about to move the camera programmatically
+      this.userMovedCamera = false
+      clearTimeout(this.idleTimer)
+      this.idleTimer = undefined
+      const c = this.fg.controls()
+      if (c) c.autoRotate = false
+    }
     this.refreshEmphasis()
   }
 
   setFocus(f: { nodes: Iterable<string>; edges: Iterable<string> } | null) {
     this.focus = f ? { nodes: new Set(f.nodes), edges: new Set(f.edges) } : null
+    if (this.focus === null && this.selectedId === null) {
+      this.releasePivot()
+      this.pauseRotate()
+    } else {
+      clearTimeout(this.idleTimer)
+      this.idleTimer = undefined
+      const c = this.fg.controls()
+      if (c) c.autoRotate = false
+    }
     this.refreshEmphasis()
   }
 
@@ -623,37 +675,163 @@ export class BrainEngine {
     this.hoverId = null
     this.selectedId = null
     this.focus = null
+    this.guard.cancelAll()
+    this.viewMemory = null
     if (this.hoverInTimer) { clearTimeout(this.hoverInTimer); this.hoverInTimer = null }
     if (this.hoverOutTimer) { clearTimeout(this.hoverOutTimer); this.hoverOutTimer = null }
+    this.releasePivot()
+    this.pauseRotate()
     this.applyFocus(null)
   }
 
   setFilters(types: Set<string>, clusters: Set<number>, minScore: number) {
     this.hidden = { types, clusters, minScore }
+    if (this.selectedId) {
+      const selNode = this.byId.get(this.selectedId)
+      if (!selNode || this.isHidden(selNode)) {
+        this.setSelected(null)
+      }
+    }
+    this.updateGraphBounds()
     this.updateEdgeBase()
   }
   edgeBetween(a: string, b: string) { return this.pair.get(`${a}|${b}`) }
   hasNode(id: string) { return this.byId.has(id) }
 
   // ------------------------------------------------------------------ camera
+  private handleUserInteraction() {
+    this.isInteracting = true
+    this.userMovedCamera = true
+    this.viewMemory = null  // user navigated manually — don't restore on deselect
+    this.guard.markUserInput()
+    this.guard.cancelAll()
+    if (this.fitTimer) {
+      clearTimeout(this.fitTimer)
+      this.fitTimer = undefined
+    }
+
+    const cam = this.fg.camera()
+    const controls = this.fg.controls()
+    if (cam && controls?.target) {
+      this.fg.cameraPosition(
+        { x: cam.position.x, y: cam.position.y, z: cam.position.z },
+        { x: controls.target.x, y: controls.target.y, z: controls.target.z },
+        0
+      )
+    }
+
+    if (controls) {
+      controls.autoRotate = false
+    }
+    clearTimeout(this.idleTimer)
+    this.idleTimer = undefined
+  }
+
   private pauseRotate() {
     const c = this.fg.controls(); if (!c) return
     c.autoRotate = false
     clearTimeout(this.idleTimer)
-    if (this.opts.autoRotate) this.idleTimer = setTimeout(() => { if (!this.disposed) c.autoRotate = true }, 7000)
+    this.idleTimer = undefined
+
+    if (!this.opts.autoRotate) return
+    if (this.selectedId !== null || this.focus !== null) return
+
+    this.idleTimer = setTimeout(() => {
+      if (this.disposed) return
+      const controls = this.fg.controls()
+      if (!controls) return
+      if (this.selectedId === null && this.focus === null && this.opts.autoRotate) {
+        if (!this.guard.userActiveWithin(7000)) {
+          controls.autoRotate = true
+        }
+      }
+    }, 7000)
   }
+
   setAutoRotate(on: boolean) {
     this.opts.autoRotate = on
-    const c = this.fg.controls(); if (c) c.autoRotate = on
+    const c = this.fg.controls()
+    if (!on) {
+      if (c) c.autoRotate = false
+      clearTimeout(this.idleTimer)
+      this.idleTimer = undefined
+    } else {
+      this.pauseRotate()
+    }
   }
-  flyTo(id: string, dist = 120, ms = 1100) {
+
+  moveCamera(
+    reason: string,
+    toPos: Vec3,
+    lookAt: Vec3,
+    ms = 700,
+    opts: { force?: boolean } = {}
+  ) {
+    const force = opts.force ?? false
+    const userActiveMs = this.guard.getUserActiveMs()
+    const userActive = this.guard.userActiveWithin(1500)
+
+    if (!shouldRunMove(userActiveMs, force, true)) {
+      this.logCamDebug('moveCamera skipped (user active)', { reason, force, userActiveMs })
+      return
+    }
+
+    const token = this.guard.begin()
+    this.pauseRotate()
+
+    const cam = this.fg.camera() as THREE.PerspectiveCamera
+    this.logCamDebug('moveCamera start', {
+      reason,
+      forced: force,
+      token,
+      userActiveWithin: userActive,
+      from: cam ? { x: cam.position.x, y: cam.position.y, z: cam.position.z } : null,
+      to: toPos,
+      lookAt,
+      ms,
+    })
+
+    if (!this.guard.isCurrent(token)) return
+
+    this.fg.cameraPosition(toPos, lookAt, ms)
+
+    if (ms > 0) {
+      setTimeout(() => {
+        if (!this.guard.isCurrent(token)) {
+          this.logCamDebug('moveCamera cancelled in flight', { reason, token })
+          return
+        }
+        this.logCamDebug('moveCamera completed', { reason, token })
+      }, ms)
+    }
+  }
+
+  flyTo(id: string, dist = 120, ms = 1100, opts: { force?: boolean } = { force: true }) {
     const n = this.byId.get(id); if (!n) return
+
+    // Save the current camera state before flying — used to restore on deselect
+    // only if the user hasn't manually navigated away in the meantime.
+    const cam = this.fg.camera() as THREE.PerspectiveCamera
+    const controls = this.fg.controls()
+    if (cam && controls?.target && !this.userMovedCamera) {
+      this.viewMemory = {
+        pos: cam.position.clone(),
+        target: controls.target.clone(),
+      }
+    }
+
     const v = new THREE.Vector3(n.x, n.y, n.z)
     const dir = v.lengthSq() < 1 ? new THREE.Vector3(0, 0, 1) : v.clone().normalize()
-    this.pauseRotate()
-    this.fg.cameraPosition({ x: n.x + dir.x * dist, y: n.y + dir.y * dist + 12, z: n.z + dir.z * dist }, { x: n.x, y: n.y, z: n.z }, ms)
+    this.moveCamera(
+      `flyTo:${id}`,
+      { x: n.x + dir.x * dist, y: n.y + dir.y * dist + 12, z: n.z + dir.z * dist },
+      { x: n.x, y: n.y, z: n.z },
+      ms,
+      opts
+    )
   }
-  fitTo(ids: string[], ms = 1100) {
+
+  fitTo(ids: string[], ms = 1100, opts: { force?: boolean } = { force: false }) {
     const pts = ids.map((i) => this.byId.get(i)).filter(Boolean) as GNode[]
     if (!pts.length) return
     const c = new THREE.Vector3()
@@ -661,19 +839,22 @@ export class BrainEngine {
     let r = 0; pts.forEach((p) => { r = Math.max(r, c.distanceTo(new THREE.Vector3(p.x, p.y, p.z))) })
     const dir = c.lengthSq() < 1 ? new THREE.Vector3(0, 0, 1) : c.clone().normalize()
     const d = Math.max(90, r * 2.4 + 60)
-    this.pauseRotate()
-    this.fg.cameraPosition({ x: c.x + dir.x * d, y: c.y + dir.y * d + 14, z: c.z + dir.z * d }, { x: c.x, y: c.y, z: c.z }, ms)
+    this.moveCamera(
+      `fitTo:${ids.length}nodes`,
+      { x: c.x + dir.x * d, y: c.y + dir.y * d + 14, z: c.z + dir.z * d },
+      { x: c.x, y: c.y, z: c.z },
+      ms,
+      opts
+    )
   }
 
-  frameGraph() {
-    // Never fit while a hover/selection/focus emphasis is active
-    if (this.emph !== null || this.hoverId !== null || this.selectedId !== null || this.focus !== null) {
+  private updateGraphBounds() {
+    const visibleNodes = this.nodes.filter((n) => !this.isHidden(n))
+    if (visibleNodes.length === 0) {
+      this.lastCenter.set(0, 0, 0)
+      this.lastBoundingRadius = 100
       return
     }
-
-    const visibleNodes = this.nodes.filter((n) => !this.isHidden(n))
-    if (visibleNodes.length === 0) return
-
     const center = new THREE.Vector3()
     visibleNodes.forEach((n) => center.add(new THREE.Vector3(n.x, n.y, n.z)))
     center.divideScalar(visibleNodes.length)
@@ -684,17 +865,111 @@ export class BrainEngine {
       const d = center.distanceTo(new THREE.Vector3(n.x, n.y, n.z))
       if (d > radius) radius = d
     })
-    radius = Math.max(radius, 25)
-    this.lastBoundingRadius = radius
+    this.lastBoundingRadius = Math.max(radius, 25)
+
+    const controls = this.fg.controls()
+    if (controls) {
+      controls.maxDistance = Math.max(2600, this.lastBoundingRadius * 6)
+    }
+  }
+
+  /**
+   * On deselect: if the user has NOT manually moved the camera since flyTo was called,
+   * smoothly fly back to the saved view. Otherwise just release the pivot in-place.
+   */
+  private restoreViewOrReleasePivot() {
+    const mem = this.viewMemory
+    const doRestore = shouldRestore(
+      mem !== null,
+      this.userMovedCamera,
+      this.guard.getUserActiveMs(),
+      2000
+    )
+    if (doRestore && mem) {
+      // Fly back to saved camera position, restoring the original pivot too
+      const token = this.guard.begin()
+      const controls = this.fg.controls()
+      if (controls) {
+        // Restore target immediately so post-tween orbit pivots correctly
+        controls.target.copy(mem.target)
+        controls.update()
+      }
+      this.fg.cameraPosition(
+        { x: mem.pos.x, y: mem.pos.y, z: mem.pos.z },
+        { x: mem.target.x, y: mem.target.y, z: mem.target.z },
+        700
+      )
+      setTimeout(() => {
+        if (!this.guard.isCurrent(token)) return
+        this.logCamDebug('restoreView completed', { token })
+        this.viewMemory = null
+      }, 710)
+    } else {
+      // User moved the camera — just fix the pivot in-place
+      this.releasePivot()
+      this.viewMemory = null
+    }
+  }
+
+  releasePivot() {
+    const controls = this.fg.controls()
+    const cam = this.fg.camera() as THREE.PerspectiveCamera
+    if (!controls || !cam) return
+
+    const camPos = cam.position
+    const forward = new THREE.Vector3()
+    cam.getWorldDirection(forward)
+
+    const minDist = controls.minDistance || 15
+    const maxDist = controls.maxDistance || Math.max(2600, this.lastBoundingRadius * 6)
+
+    const newTarget = releasePivot(
+      { x: camPos.x, y: camPos.y, z: camPos.z },
+      { x: forward.x, y: forward.y, z: forward.z },
+      { x: this.lastCenter.x, y: this.lastCenter.y, z: this.lastCenter.z },
+      minDist,
+      maxDist
+    )
+
+    controls.target.set(newTarget.x, newTarget.y, newTarget.z)
+    controls.update()
+    this.logCamDebug('releasePivot', { newTarget, graphCenter: this.lastCenter })
+  }
+
+  resetPivotToCentre() {
+    const controls = this.fg.controls()
+    if (controls) {
+      controls.target.copy(this.lastCenter)
+      controls.update()
+      this.logCamDebug('resetPivotToCentre', { center: this.lastCenter })
+    }
+  }
+
+  restoreView() {
+    this.clearFocusState()
+    this.releasePivot()
+    this.frameGraph(700, { force: true })
+  }
+
+  frameGraph(ms = 700, opts: { force?: boolean } = {}) {
+    const force = opts.force ?? false
+    if (!force && (this.emph !== null || this.hoverId !== null || this.selectedId !== null || this.focus !== null)) {
+      return
+    }
+
+    const visibleNodes = this.nodes.filter((n) => !this.isHidden(n))
+    if (visibleNodes.length === 0) return
+
+    this.updateGraphBounds()
+    const center = this.lastCenter.clone()
+    const radius = this.lastBoundingRadius
 
     const cam = this.fg.camera() as THREE.PerspectiveCamera
     const fovRad = ((cam.fov || 50) * Math.PI) / 180
     const w = this.el.clientWidth || window.innerWidth || 800
     const h = this.el.clientHeight || window.innerHeight || 600
     const aspect = w / h
-    // Half-FOV corresponding to the smaller canvas dimension
     const halfFov = aspect < 1 ? Math.atan(Math.tan(fovRad / 2) * aspect) : fovRad / 2
-    // distance = radius / sin(fov/2) * 1.15
     const distance = (radius / Math.sin(halfFov)) * 1.15
 
     const currentPos = cam.position.clone()
@@ -705,25 +980,37 @@ export class BrainEngine {
     dir.normalize()
 
     const targetPos = center.clone().add(dir.multiplyScalar(distance))
-    this.pauseRotate()
-    this.fg.cameraPosition(targetPos, center, 700)
+    this.moveCamera(
+      'frameGraph',
+      { x: targetPos.x, y: targetPos.y, z: targetPos.z },
+      { x: center.x, y: center.y, z: center.z },
+      ms,
+      opts
+    )
     this.userMovedCamera = false
 
     this.logVisDebug('fit')
   }
 
-  fit(_ms = 900, _pad = 50) {
+  fit(ms = 900, _pad = 50) {
     this.clearFocusState()
-    this.frameGraph()
+    this.resetPivotToCentre()
+    this.frameGraph(ms, { force: true })
   }
 
   private scheduleFit(delay: number) {
     clearTimeout(this.fitTimer)
     this.fitTimer = setTimeout(() => {
-      if (!this.disposed && this.nodes.length) {
-        this.frameGraph()
+      if (!this.disposed && this.nodes.length && !this.userMovedCamera) {
+        this.frameGraph(700, { force: false })
       }
     }, delay)
+  }
+
+  private logCamDebug(action: string, details: Record<string, any>) {
+    if (typeof window !== 'undefined' && window.location?.search?.includes('debug=cam')) {
+      console.log(`[NexMind:cam ${action}]`, details)
+    }
   }
 
   /** Place the camera on a sphere around the origin (used by the landing page's scroll-driven hero). */
@@ -888,9 +1175,13 @@ export class BrainEngine {
         this.layoutTween = null
         this.updateEdgeBase()
         this.rebuildDecor()
+        this.updateGraphBounds()
         // Reset emphasis guard after relayout/relax finishes
         if (!this.hoverId && !this.selectedId && !this.focus) {
           this.applyFocus(null)
+        }
+        if (!this.userMovedCamera && this.nodes.length > 0) {
+          this.frameGraph(700, { force: false })
         }
       }
     }
@@ -1017,7 +1308,7 @@ export class BrainEngine {
     this.bloom?.setSize(w, h)
     this.edgeRenderer.setResolution(w, h)
     if (!this.userMovedCamera && this.nodes.length > 0) {
-      this.frameGraph()
+      this.frameGraph(700, { force: false })
     }
   }
 
@@ -1027,9 +1318,13 @@ export class BrainEngine {
     if (this.hoverInTimer) clearTimeout(this.hoverInTimer)
     if (this.hoverOutTimer) clearTimeout(this.hoverOutTimer)
     if (this.pickThrottleTimer) clearTimeout(this.pickThrottleTimer)
-    clearTimeout(this.fitTimer); clearTimeout(this.idleTimer)
+    if (this.fitTimer) clearTimeout(this.fitTimer)
+    if (this.idleTimer) clearTimeout(this.idleTimer)
     this.timers.forEach((t) => clearTimeout(t)); this.timers.clear()
-    this.ro.disconnect(); this.el.removeEventListener('pointermove', this.onMove)
+    this.ro.disconnect()
+    this.el.removeEventListener('pointermove', this.onMove)
+    this.el.removeEventListener('wheel', this.onUserActivity)
+    this.el.removeEventListener('pointerdown', this.onUserActivity)
     this.edgeRenderer.dispose(this.fg.scene())
     try { this.fg.pauseAnimation(); this.fg._destructor?.() } catch { /* already gone */ }
     this.nodeTex.dispose(); this.ringTex.dispose(); this.nebulaTex.dispose()

@@ -76,28 +76,58 @@ def cmd_doctor(_: argparse.Namespace) -> int:
 
 
 def cmd_connect(args: argparse.Namespace) -> int:
-    import urllib.request
     import json
     import os
+    import urllib.error
+    import urllib.request
+    import webbrowser
     from .config import settings
 
-    port = args.port or settings.port
-    host = args.host or settings.host
-    if host in ("0.0.0.0", "localhost"):
-        host = "127.0.0.1"
-    url = f"http://{host}:{port}/api/connect"
-    
     path = os.path.abspath(args.path or ".")
+    server_arg = args.server or f"http://127.0.0.1:{getattr(args, 'port', None) or settings.port}"
+    server_url = server_arg.rstrip("/")
+    if not (server_url.startswith("http://") or server_url.startswith("https://")):
+        server_url = f"http://{server_url}"
+
+    url = f"{server_url}/api/connect"
+    payload = {
+        "path": path,
+        "watch": not getattr(args, "no_watch", False),
+    }
+    if getattr(args, "name", None):
+        payload["name"] = args.name
+
     try:
-        req = urllib.request.Request(url, method="POST", data=json.dumps({"path": path}).encode("utf-8"), headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req) as resp:
+        req = urllib.request.Request(
+            url,
+            method="POST",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
-            print(f"Connected to NexMind! Workspace ID: {data.get('workspace_id')}")
-            print(f"Graph will rebuild automatically when files in {path} change.")
-            return 0
-    except Exception as e:
-        print(f"Error connecting: {e}. Is the NexMind server running on port {port}?")
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = json.loads(e.read().decode())
+            detail = err_body.get("detail", str(e))
+        except Exception:
+            detail = str(e)
+        print(f"Error: {detail}")
         return 1
+    except Exception:
+        print("NexMind server is not running. Start it with: python -m nexmind serve")
+        return 1
+
+    ws_url = data.get("url") or f"{server_url}/app/w/{data.get('workspace_id')}"
+    print(f"Connected {path} to NexMind")
+    print(ws_url)
+    if not getattr(args, "no_watch", False):
+        print("Live sync is ON")
+
+    if getattr(args, "open", False):
+        webbrowser.open(ws_url)
+
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -112,8 +142,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("version")
     c = sub.add_parser("connect", help="connect the current folder to a running NexMind server (Live Connect)")
     c.add_argument("path", nargs="?", default=".", help="folder to connect (default: current directory)")
-    c.add_argument("--host", default=None)
-    c.add_argument("--port", type=int, default=None)
+    c.add_argument("--name", default=None, help="workspace name")
+    c.add_argument("--no-watch", action="store_true", help="disable auto-sync on file change")
+    c.add_argument("--server", default=None, help="NexMind server URL")
+    c.add_argument("--port", type=int, default=None, help="NexMind server port")
+    c.add_argument("--open", action="store_true", help="open workspace in browser")
     
     args = parser.parse_args(argv)
     if args.cmd == "doctor":

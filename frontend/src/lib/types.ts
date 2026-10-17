@@ -7,6 +7,8 @@ export interface Health {
   llm: { provider: string; model: string | null; available: boolean }
   capabilities?: { local_paths: boolean; git_token: boolean }
   platform?: string
+  python_executable?: string
+  install_dir?: string
 }
 
 export interface Workspace {
@@ -77,7 +79,33 @@ export interface ProcessItem {
 export interface Insight { id: string; kind: string; severity: 'info' | 'low' | 'medium' | 'high'; title: string; detail: string; node_ids: string[] }
 export interface SearchResult { query: string; nodes: Brief[]; passages: { score: number; node: Brief; snippet: string; kind: string }[]; highlight: { nodes: string[] } }
 export interface SourceItem { id: string; name: string; kind: string; origin: string; size: number; file_count: number }
-export interface FsListing { path: string; parent: string | null; entries: { name: string; path: string }[]; roots: { name: string; path: string }[] }
+export interface FsEntry {
+  name: string
+  path: string
+  kind: 'dir' | 'file'
+  size?: number
+  is_project?: boolean
+  markers?: string[] | null
+}
+export interface FsListing {
+  path: string
+  parent: string | null
+  crumbs: { name: string; path: string }[]
+  roots: { name: string; path: string }[]
+  entries: FsEntry[]
+  truncated?: boolean
+}
+export interface FsCheckResult {
+  ok: boolean
+  exists: boolean
+  is_dir: boolean
+  readable: boolean
+  markers: string[]
+  supported_files: number
+  has_code: boolean
+  has_docs: boolean
+  message: string
+}
 export interface JobInfo { id: string; status: 'queued' | 'running' | 'done' | 'failed'; progress: number; phase: string; message: string; error?: string | null; result?: Record<string, unknown> | null }
 export interface TreeNode extends Brief { children: TreeNode[] }
 

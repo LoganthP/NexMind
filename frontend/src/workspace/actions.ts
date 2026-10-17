@@ -15,6 +15,7 @@ export function clearAll() {
   eng.current?.cancelPath()
   eng.current?.setSelected(null)
   eng.current?.setFocus(null)
+  eng.current?.releasePivot()
   eng.current?.clearFocusState()
   patch({ selectedId: null, selectedEdgeId: null, drawerOpen: false, focus: null, impact: null, trace: null, traceFrom: null, activations: [], flowProc: null, flowStep: -1, flowPlaying: false })
 }
@@ -29,7 +30,7 @@ export function selectNode(id: string, fly = true) {
   const v = get()
   if (v.mode === 'trace') return void traceClick(id)
   eng.current?.setSelected(id)
-  if (fly) eng.current?.flyTo(id)
+  if (fly) eng.current?.flyTo(id, 120, 1100, { force: true })
   patch({ selectedId: id, selectedEdgeId: null, drawerOpen: v.mode !== 'impact' })
   if (v.mode === 'impact') void runImpact(id)
 }

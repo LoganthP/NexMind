@@ -39,14 +39,21 @@ export function CopyBlock({ label, command }: { label: string; command: string }
     setDone(true); setTimeout(() => setDone(false), 1600)
   }
   return (
-    <div className="overflow-hidden rounded-xl border hair bg-black/45">
+    <div className="w-full min-w-0 max-w-full overflow-hidden rounded-xl border hair bg-black/45">
       <div className="flex items-center justify-between border-b hair px-3 py-1.5">
-        <span className="flex items-center gap-1.5 text-xs text-mist"><i className="h-2 w-2 rounded-full bg-coral/80" /><i className="h-2 w-2 rounded-full bg-amber/80" /><i className="h-2 w-2 rounded-full bg-plankton/80" /><span className="ml-2">{label}</span></span>
-        <button className="icon-btn !h-7 !w-7" onClick={copy} aria-label={`Copy command: ${command}`}>
+        <span className="flex items-center gap-1.5 text-xs text-mist min-w-0">
+          <i className="h-2 w-2 shrink-0 rounded-full bg-coral/80" />
+          <i className="h-2 w-2 shrink-0 rounded-full bg-amber/80" />
+          <i className="h-2 w-2 shrink-0 rounded-full bg-plankton/80" />
+          <span className="ml-2 truncate">{label}</span>
+        </span>
+        <button className="icon-btn !h-7 !w-7 shrink-0" onClick={copy} aria-label={`Copy command: ${command}`}>
           {done ? <Check size={15} className="text-plankton" /> : <Copy size={15} />}
         </button>
       </div>
-      <pre className="mono overflow-x-auto px-3 py-3 text-[0.82rem] text-ink"><span className="select-none text-plankton">$ </span>{command}</pre>
+      <pre className="mono overflow-x-auto min-w-0 max-w-full px-3 py-3 text-[0.82rem] text-ink whitespace-pre-wrap break-all sm:whitespace-pre sm:break-normal">
+        <span className="select-none text-plankton">$ </span>{command}
+      </pre>
     </div>
   )
 }

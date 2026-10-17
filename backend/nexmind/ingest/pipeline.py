@@ -46,10 +46,17 @@ class GraphBuilder:
         self.chunks: list[dict] = []
 
     def add_node(self, nid: str, ntype: str, label: str, **props: Any) -> str:
+        clean_label = (label or "").strip()
+        if not clean_label:
+            clean_label = props.get("name") or props.get("path") or nid
+        if ntype == "Document" and clean_label.lower() in ("untitled", "anonymous"):
+            clean_label = Path(props.get("path", nid)).stem.replace("_", " ").title() or "Document"
         n = self.nodes.get(nid)
         if n is None:
-            self.nodes[nid] = {"id": nid, "type": ntype, "label": label, "props": dict(props), "x": 0.0, "y": 0.0, "z": 0.0, "cluster": 0, "score": 0.0}
+            self.nodes[nid] = {"id": nid, "type": ntype, "label": clean_label, "props": dict(props), "x": 0.0, "y": 0.0, "z": 0.0, "cluster": 0, "score": 0.0}
         else:
+            if clean_label:
+                n["label"] = clean_label
             n["props"].update({k: v for k, v in props.items() if v not in (None, "")})
         return nid
 

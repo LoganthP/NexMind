@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import __version__
-from .api import chat_routes, graph_routes, workspaces, ws, connect
+from .api import chat_routes, graph_routes, workspaces, ws, connect, connect_script
 from .config import settings
 from .events import hub
 from .ingest.files import IngestError
@@ -100,6 +100,7 @@ app.include_router(graph_routes.router)
 app.include_router(chat_routes.router)
 app.include_router(ws.router)
 app.include_router(connect.router)
+app.include_router(connect_script.router)
 
 
 @app.get("/api/health", tags=["system"])
@@ -107,7 +108,8 @@ def health() -> dict:
     return {
         "app": "nexmind", "status": "ok", "version": __version__,
         "capabilities": {"local_paths": settings.allow_local_paths, "git_token": True, "websocket": True, "sse_chat": True},
-        "platform": sys.platform, "python": sys.version.split()[0], "llm": get_llm().info(), "embeddings": settings.embeddings,
+        "platform": sys.platform, "python": sys.version.split()[0], "python_executable": sys.executable,
+        "install_dir": str(Path(__file__).resolve().parent), "llm": get_llm().info(), "embeddings": settings.embeddings,
         "limits": {"max_upload_mb": settings.max_upload_mb, "max_files": settings.max_files, "git_hosts": settings.git_hosts},
         "workspaces": (db.one("SELECT COUNT(*) AS n FROM workspaces") or {}).get("n", 0),
     }
