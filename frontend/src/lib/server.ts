@@ -72,20 +72,50 @@ let running = false
 /** Poll for the local server: fast while it is missing (like "Listening for server…"), slow once connected. */
 export function startServerWatch(): () => void {
   running = true
+
+  const scheduleNext = (delay: number) => {
+    clearTimeout(timer)
+    if (!running) return
+    timer = setTimeout(loop, delay)
+  }
+
   const loop = async () => {
     if (!running) return
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      return
+    }
     const ok = await useServer.getState().check()
     if (!running) return
-    timer = setTimeout(loop, ok ? 7000 : 1500)
+    scheduleNext(ok ? 15000 : 1500)
   }
+
+  const onVisChange = () => {
+    if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+      if (running) void loop()
+    } else {
+      clearTimeout(timer)
+    }
+  }
+
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', onVisChange)
+  }
+
   // Remove the duplicate first probe: startServerWatch should not fire its own immediate check if one is already in flight.
   if (inFlight) {
     inFlight.then((ok) => {
       if (!running) return
-      timer = setTimeout(loop, ok ? 7000 : 1500)
+      scheduleNext(ok ? 15000 : 1500)
     })
   } else {
     void loop()
   }
-  return () => { running = false; clearTimeout(timer) }
+
+  return () => {
+    running = false
+    clearTimeout(timer)
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', onVisChange)
+    }
+  }
 }

@@ -89,32 +89,127 @@ export function formatApiError(e: unknown): string {
   return str.replace(/^Error:\s*/i, '').replace(/^\d{3}\s+/, '').trim() || 'An error occurred.'
 }
 
-async function request<T>(path: string, init: RequestInit = {}, base = getApiBase(), timeoutMs = 30000): Promise<T> {
-  const ctl = new AbortController()
-  const timer = setTimeout(() => ctl.abort(), timeoutMs)
-  try {
-    const headers: Record<string, string> = { ...(init.headers as Record<string, string> | undefined) }
-    if (init.body && typeof init.body === 'string') headers['Content-Type'] = 'application/json'
-    const res = await fetch(base + path, { ...init, headers, signal: init.signal ?? ctl.signal })
-    if (!res.ok) {
-      let detail = `${res.status} ${res.statusText}`
-      let raw: any = undefined
-      try {
-        const j = await res.json()
-        raw = j.detail ?? j
-        detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail ?? j)
-      } catch { /* not json */ }
-      throw new ApiError(detail, res.status, raw)
-    }
-    if (res.status === 204) return undefined as T
-    return (await res.json()) as T
-  } catch (e) {
-    if (e instanceof ApiError) throw e
-    if ((e as Error).name === 'AbortError') throw new ApiError('The server took too long to respond', 0)
-    throw new ApiError('Cannot reach the NexMind server. Is it running?', 0)
-  } finally {
-    clearTimeout(timer)
+class LRUCache<K, V> {
+  private max: number
+  private map = new Map<K, V>()
+
+  constructor(max = 500) {
+    this.max = max
   }
+
+  get(key: K): V | undefined {
+    const val = this.map.get(key)
+    if (val !== undefined) {
+      this.map.delete(key)
+      this.map.set(key, val)
+    }
+    return val
+  }
+
+  has(key: K): boolean {
+    return this.map.has(key)
+  }
+
+  set(key: K, val: V): void {
+    if (this.map.has(key)) {
+      this.map.delete(key)
+    } else if (this.map.size >= this.max) {
+      const firstKey = this.map.keys().next().value
+      if (firstKey !== undefined) this.map.delete(firstKey)
+    }
+    this.map.set(key, val)
+  }
+
+  clear(): void {
+    this.map.clear()
+  }
+}
+
+const nodeBriefCache = new LRUCache<string, NodeDetail>(500)
+const edgeCache = new LRUCache<string, EdgeDetail>(500)
+const inFlightGets = new Map<string, Promise<any>>()
+
+function wrapWithSignal<T>(promise: Promise<T>, signal?: AbortSignal | null): Promise<T> {
+  if (!signal) return promise
+  if (signal.aborted) return Promise.reject(new DOMException('The user aborted a request.', 'AbortError'))
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new DOMException('The user aborted a request.', 'AbortError'))
+    signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(
+      (val) => { signal.removeEventListener('abort', onAbort); resolve(val) },
+      (err) => { signal.removeEventListener('abort', onAbort); reject(err) },
+    )
+  })
+}
+
+async function request<T>(path: string, init: RequestInit = {}, base = getApiBase(), timeoutMs = 30000): Promise<T> {
+  const method = (init.method || 'GET').toUpperCase()
+  const isGet = method === 'GET'
+  const cacheKey = isGet ? `${base}${path}` : null
+
+  if (isGet && cacheKey) {
+    const existing = inFlightGets.get(cacheKey)
+    if (existing) {
+      return wrapWithSignal(existing as Promise<T>, init.signal)
+    }
+  }
+
+  const exec = async (): Promise<T> => {
+    const ctl = new AbortController()
+    const timer = setTimeout(() => ctl.abort(), timeoutMs)
+    let abortListener: (() => void) | undefined
+    if (init.signal) {
+      if (init.signal.aborted) {
+        clearTimeout(timer)
+        throw new DOMException('The user aborted a request.', 'AbortError')
+      }
+      abortListener = () => ctl.abort()
+      init.signal.addEventListener('abort', abortListener, { once: true })
+    }
+    try {
+      const headers: Record<string, string> = { ...(init.headers as Record<string, string> | undefined) }
+      // Keep GET requests "simple": no custom headers, no Content-Type on GETs to avoid extra preflights
+      if (!isGet && init.body && typeof init.body === 'string') {
+        headers['Content-Type'] = 'application/json'
+      }
+      const res = await fetch(base + path, { ...init, headers, signal: ctl.signal })
+      if (!res.ok) {
+        let detail = `${res.status} ${res.statusText}`
+        let raw: any = undefined
+        try {
+          const j = await res.json()
+          raw = j.detail ?? j
+          detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail ?? j)
+        } catch { /* not json */ }
+        throw new ApiError(detail, res.status, raw)
+      }
+      if (res.status === 204) return undefined as T
+      return (await res.json()) as T
+    } catch (e) {
+      if (e instanceof ApiError) throw e
+      if ((e as Error).name === 'AbortError') {
+        if (init.signal?.aborted) throw e
+        throw new ApiError('The server took too long to respond', 0)
+      }
+      throw new ApiError('Cannot reach the NexMind server. Is it running?', 0)
+    } finally {
+      clearTimeout(timer)
+      if (abortListener && init.signal) {
+        init.signal.removeEventListener('abort', abortListener)
+      }
+    }
+  }
+
+  if (isGet && cacheKey) {
+    const promise = exec()
+    inFlightGets.set(cacheKey, promise)
+    promise.finally(() => {
+      inFlightGets.delete(cacheKey)
+    }).catch(() => {})
+    return wrapWithSignal(promise, init.signal)
+  }
+
+  return exec()
 }
 
 const j = (body: unknown) => JSON.stringify(body)
@@ -160,18 +255,48 @@ export const api = {
   job: (id: string) => request<JobInfo>(`/api/jobs/${id}`),
   rawUrl: (wsId: string, sid: string, path: string) => `${getApiBase()}/api/workspaces/${wsId}/sources/${sid}/raw${q({ path })}`,
 
-  graph: (id: string, o: { types?: string; cluster?: number; max_nodes?: number; focus?: string; depth?: number } = {}) =>
-    request<GraphPayload>(`/api/workspaces/${id}/graph${q(o)}`, {}, getApiBase(), 120000),
-  node: (id: string, nid: string) => request<NodeDetail>(`/api/workspaces/${id}/nodes/${encodeURIComponent(nid)}`),
-  nodeBrief: (id: string, nid: string) => request<NodeDetail>(`/api/workspaces/${id}/nodes/${encodeURIComponent(nid)}?brief=true`),
-  neighbors: (id: string, nid: string, depth = 1) => request<{ nodes: GraphPayload['nodes']; links: GraphPayload['links'] }>(`/api/workspaces/${id}/nodes/${encodeURIComponent(nid)}/neighbors${q({ depth })}`),
-  explain: (id: string, nid: string) => request<{ explanation: string; provider: string }>(`/api/workspaces/${id}/nodes/${encodeURIComponent(nid)}/explain`, {}, getApiBase(), 90000),
-  edge: (id: string, eid: string) => request<EdgeDetail>(`/api/workspaces/${id}/edges/${eid}`),
+  graph: (id: string, o: { types?: string; cluster?: number; max_nodes?: number; focus?: string; depth?: number } = {}, signal?: AbortSignal) =>
+    request<GraphPayload>(`/api/workspaces/${id}/graph${q(o)}`, { signal }, getApiBase(), 120000),
+  node: (id: string, nid: string, signal?: AbortSignal) =>
+    request<NodeDetail>(`/api/workspaces/${id}/nodes/${encodeURIComponent(nid)}`, { signal }).then((data) => {
+      nodeBriefCache.set(`${id}:${nid}`, data)
+      return data
+    }),
+  nodeBrief: (id: string, nid: string, signal?: AbortSignal) => {
+    const key = `${id}:${nid}`
+    const cached = nodeBriefCache.get(key)
+    if (cached) return Promise.resolve(cached)
+    return request<NodeDetail>(`/api/workspaces/${id}/nodes/${encodeURIComponent(nid)}?brief=true`, { signal }).then((data) => {
+      nodeBriefCache.set(key, data)
+      return data
+    })
+  },
+  neighbors: (id: string, nid: string, depth = 1, signal?: AbortSignal) =>
+    request<{ nodes: GraphPayload['nodes']; links: GraphPayload['links'] }>(`/api/workspaces/${id}/nodes/${encodeURIComponent(nid)}/neighbors${q({ depth })}`, { signal }),
+  explain: (id: string, nid: string, signal?: AbortSignal) =>
+    request<{ explanation: string; provider: string }>(`/api/workspaces/${id}/nodes/${encodeURIComponent(nid)}/explain`, { signal }, getApiBase(), 90000),
+  edge: (id: string, eid: string, signal?: AbortSignal) => {
+    const key = `${id}:${eid}`
+    const cached = edgeCache.get(key)
+    if (cached) return Promise.resolve(cached)
+    return request<EdgeDetail>(`/api/workspaces/${id}/edges/${eid}`, { signal }).then((data) => {
+      edgeCache.set(key, data)
+      return data
+    })
+  },
+  getNodeBriefCached: (wsId: string, nid: string): NodeDetail | undefined => nodeBriefCache.get(`${wsId}:${nid}`),
+  hasNodeBrief: (wsId: string, nid: string): boolean => nodeBriefCache.has(`${wsId}:${nid}`),
+  getEdgeCached: (wsId: string, eid: string): EdgeDetail | undefined => edgeCache.get(`${wsId}:${eid}`),
+  hasEdge: (wsId: string, eid: string): boolean => edgeCache.has(`${wsId}:${eid}`),
+  clearCache: (): void => {
+    nodeBriefCache.clear()
+    edgeCache.clear()
+  },
   search: (id: string, text: string) => request<SearchResult>(`/api/workspaces/${id}/search${q({ q: text })}`),
   impact: (id: string, node: string, direction: 'upstream' | 'downstream' = 'upstream', depth = 4) => request<ImpactResult>(`/api/workspaces/${id}/impact${q({ node, direction, depth })}`),
   trace: (id: string, source: string, target: string) => request<TraceResult>(`/api/workspaces/${id}/trace${q({ source, target })}`),
-  processes: (id: string) => request<ProcessItem[]>(`/api/workspaces/${id}/processes`),
-  insights: (id: string) => request<Insight[]>(`/api/workspaces/${id}/insights`),
+  processes: (id: string, signal?: AbortSignal) => request<ProcessItem[]>(`/api/workspaces/${id}/processes`, { signal }),
+  insights: (id: string, signal?: AbortSignal) => request<Insight[]>(`/api/workspaces/${id}/insights`, { signal }),
   exportUrl: (id: string, format: 'json' | 'graphml' | 'cypher') => `${getApiBase()}/api/workspaces/${id}/export?format=${format}`,
 
   threads: (id: string) => request<Thread[]>(`/api/workspaces/${id}/threads`),

@@ -1,36 +1,59 @@
 import { useEffect, useState } from 'react'
 import { api } from '@/lib/api'
 import { useView } from '@/lib/store'
+import { typeColor } from '@/lib/palette'
 import type { EdgeDetail, NodeDetail } from '@/lib/types'
 import { eng } from '@/workspace/actions'
-
-const nodeCache = new Map<string, NodeDetail>()
-const edgeCache = new Map<string, EdgeDetail>()
 
 export function Tooltip() {
   const hoverId = useView((s) => s.hoverId)
   const edgeId = useView((s) => s.hoverEdgeId)
   const pos = useView((s) => s.hoverPos)
-  const colors = useView((s) => s.legend.node)
   const [node, setNode] = useState<NodeDetail | null>(null)
   const [edge, setEdge] = useState<EdgeDetail | null>(null)
 
   useEffect(() => {
-    if (!hoverId) { setNode(null); return }
-    const key = eng.wsId + hoverId
-    if (nodeCache.has(key)) { setNode(nodeCache.get(key)!); return }
-    let live = true
-    const t = setTimeout(() => api.nodeBrief(eng.wsId, hoverId).then((d) => { nodeCache.set(key, d); if (live) setNode(d) }).catch(() => {}), 110)
-    return () => { live = false; clearTimeout(t) }
+    if (!hoverId) {
+      setNode(null)
+      return
+    }
+    const cached = api.getNodeBriefCached(eng.wsId, hoverId)
+    if (cached) {
+      setNode(cached)
+      return
+    }
+    const ctl = new AbortController()
+    const t = setTimeout(() => {
+      api.nodeBrief(eng.wsId, hoverId, ctl.signal)
+        .then((d) => setNode(d))
+        .catch(() => {})
+    }, 150)
+    return () => {
+      clearTimeout(t)
+      ctl.abort()
+    }
   }, [hoverId])
 
   useEffect(() => {
-    if (!edgeId || hoverId) { setEdge(null); return }
-    const key = eng.wsId + edgeId
-    if (edgeCache.has(key)) { setEdge(edgeCache.get(key)!); return }
-    let live = true
-    const t = setTimeout(() => api.edge(eng.wsId, edgeId).then((d) => { edgeCache.set(key, d); if (live) setEdge(d) }).catch(() => {}), 140)
-    return () => { live = false; clearTimeout(t) }
+    if (!edgeId || hoverId) {
+      setEdge(null)
+      return
+    }
+    const cached = api.getEdgeCached(eng.wsId, edgeId)
+    if (cached) {
+      setEdge(cached)
+      return
+    }
+    const ctl = new AbortController()
+    const t = setTimeout(() => {
+      api.edge(eng.wsId, edgeId, ctl.signal)
+        .then((d) => setEdge(d))
+        .catch(() => {})
+    }, 150)
+    return () => {
+      clearTimeout(t)
+      ctl.abort()
+    }
   }, [edgeId, hoverId])
 
   if (!pos || (!node && !edge)) return null
@@ -41,7 +64,7 @@ export function Tooltip() {
       {node && node.id === hoverId && (
         <>
           <div className="flex items-center gap-2">
-            <i className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: colors[node.type] ?? node.color ?? '#5cf2d6', boxShadow: `0 0 10px ${colors[node.type] ?? '#5cf2d6'}` }} />
+            <i className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: typeColor(node.type), boxShadow: `0 0 10px ${typeColor(node.type)}` }} />
             <span className="truncate font-semibold">{node.label}</span>
             <span className="chip ml-auto shrink-0">{node.type}</span>
           </div>

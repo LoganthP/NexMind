@@ -1,13 +1,14 @@
 """Graph endpoints: the data the 3D UI renders and the details shown on hover / click."""
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 
 import networkx as nx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, Response
 
 from ..graph import analysis as A
@@ -221,6 +222,20 @@ def breadcrumb(wg: WorkspaceGraph, nid: str) -> list[dict]:
     return list(reversed(chain))
 
 
+def check_etag(request: Request, ws: dict) -> tuple[str, bool]:
+    updated_at = str(ws.get("updated_at", ""))
+    query_str = str(request.url.query)
+    raw = f"{ws.get('id', '')}:{updated_at}:{query_str}"
+    tag = f'"{hashlib.sha1(raw.encode("utf-8")).hexdigest()}"'
+    inm = request.headers.get("if-none-match")
+    if inm:
+        client_tags = [t.strip().lstrip("W/") for t in inm.split(",")]
+        clean_tag = tag.strip().lstrip("W/")
+        if clean_tag in client_tags or "*" in client_tags:
+            return tag, True
+    return tag, False
+
+
 # ============================================================================ graph
 
 @router.post("/relayout")
@@ -251,6 +266,8 @@ def relayout(ws_id: str):
 @router.get("/graph")
 def get_graph(
     ws_id: str,
+    request: Request,
+    response: Response,
     types: str | None = Query(None, description="comma-separated node types to include"),
     edge_types: str | None = Query(None, description="comma-separated edge types to include"),
     cluster: int | None = None,
@@ -260,7 +277,14 @@ def get_graph(
     depth: int = Query(2, ge=1, le=5),
     include_processes: bool = True,
 ):
-    wg = wg_of(ws_id)
+    ws = get_ws(ws_id)
+    tag, match = check_etag(request, ws)
+    if match:
+        return Response(status_code=304, headers={"ETag": tag, "Cache-Control": "no-cache"})
+    response.headers["ETag"] = tag
+    response.headers["Cache-Control"] = "no-cache"
+
+    wg = store.get(ws_id)
     ids = set(wg.nodes)
     if focus:
         node_or_404(wg, focus)
@@ -300,7 +324,6 @@ def get_graph(
         links = [_viz_edge(e) for e in wg.edges.values() if e["src"] in ids and e["dst"] in ids and (eset is None or e["type"] in eset)]
         nodes = [_viz_node(wg.nodes[i]) for i in ids]
 
-    ws = get_ws(ws_id)
     return {
         "nodes": nodes, "links": links, "clusters": wg.clusters, "truncated": truncated,
         "total_nodes": len(wg.nodes), "total_edges": len(wg.edges), "status": ws["status"],
@@ -596,8 +619,15 @@ def trace(ws_id: str, source: str, target: str):
 
 
 @router.get("/processes")
-def processes(ws_id: str):
-    wg = wg_of(ws_id)
+def processes(ws_id: str, request: Request, response: Response):
+    ws = get_ws(ws_id)
+    tag, match = check_etag(request, ws)
+    if match:
+        return Response(status_code=304, headers={"ETag": tag, "Cache-Control": "no-cache"})
+    response.headers["ETag"] = tag
+    response.headers["Cache-Control"] = "no-cache"
+
+    wg = store.get(ws_id)
     out = []
     for n in wg.nodes.values():
         if n["type"] == "Process":
@@ -613,8 +643,15 @@ def processes(ws_id: str):
 
 
 @router.get("/clusters")
-def clusters(ws_id: str):
-    wg = wg_of(ws_id)
+def clusters(ws_id: str, request: Request, response: Response):
+    ws = get_ws(ws_id)
+    tag, match = check_etag(request, ws)
+    if match:
+        return Response(status_code=304, headers={"ETag": tag, "Cache-Control": "no-cache"})
+    response.headers["ETag"] = tag
+    response.headers["Cache-Control"] = "no-cache"
+
+    wg = store.get(ws_id)
     counts: dict[int, Counter] = defaultdict(Counter)
     for n in wg.nodes.values():
         counts[n.get("cluster", 0)][n["type"]] += 1
@@ -627,8 +664,15 @@ def clusters(ws_id: str):
 
 
 @router.get("/insights")
-def insights(ws_id: str):
-    return wg_of(ws_id).insights
+def insights(ws_id: str, request: Request, response: Response):
+    ws = get_ws(ws_id)
+    tag, match = check_etag(request, ws)
+    if match:
+        return Response(status_code=304, headers={"ETag": tag, "Cache-Control": "no-cache"})
+    response.headers["ETag"] = tag
+    response.headers["Cache-Control"] = "no-cache"
+
+    return store.get(ws_id).insights
 
 
 @router.get("/sources/{source_id}/tree")

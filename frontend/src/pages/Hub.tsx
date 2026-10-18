@@ -49,8 +49,36 @@ export default function Hub() {
 
   useEffect(() => {
     void load()
-    const t = setInterval(load, 4000)
-    return () => clearInterval(t)
+    let timer: ReturnType<typeof setInterval> | undefined
+
+    const start = () => {
+      if (timer) clearInterval(timer)
+      timer = setInterval(() => {
+        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+        void load()
+      }, 10000)
+    }
+
+    const onVisChange = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        void load()
+        start()
+      } else {
+        if (timer) clearInterval(timer)
+        timer = undefined
+      }
+    }
+
+    start()
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onVisChange)
+    }
+    return () => {
+      if (timer) clearInterval(timer)
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVisChange)
+      }
+    }
   }, [])
 
   const remove = async (w: Workspace) => {

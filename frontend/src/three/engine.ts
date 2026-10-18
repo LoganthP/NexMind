@@ -7,14 +7,13 @@ import { relax } from './relax'
 import { pastelClusterColor } from './labels'
 import { releasePivot, clampTarget, CameraGuard, shouldRunMove, shouldRestore, type Vec3 } from './cameraPivot'
 
+import { NODE_COLORS, typeColor } from '@/lib/palette'
+export { NODE_COLORS }
+
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type FG = any
 
 export const BG = '#040a12'
-export const NODE_COLORS: Record<string, string> = {
-  Source: '#f4f8ff', Folder: '#7f93ad', File: '#4cc9f0', Document: '#ffb35c', Section: '#ffd199', Class: '#a99bff',
-  Function: '#5cf2d6', Method: '#8ff7e4', Module: '#ff7eb6', Concept: '#ffd666', Entity: '#ff8a8a', Process: '#38e8ff',
-}
 export const EDGE_COLORS: Record<string, string> = {
   CONTAINS: '#3d546d', DEFINES: '#4d6a88', IMPORTS: '#5aa9ff', CALLS: '#5cf2d6', INHERITS: '#b79bff', REFERENCES: '#ffc857',
   MENTIONS: '#e0b84f', RELATED_TO: '#ff7c93', SIMILAR_TO: '#ff9a4d', RELATION: '#ff5c8a', HAS_STEP: '#38e8ff',
@@ -538,7 +537,7 @@ export class BrainEngine {
   private commit() { this.fg.graphData({ nodes: this.nodes, links: this.links }) }
 
   // ------------------------------------------------------------------ appearance
-  private nodeColor(n: GNode) { return this.colors.node[n.type] ?? '#9fb3c8' }
+  private nodeColor(n: GNode) { return this.colors.node[n.type] ?? typeColor(n.type) }
   private sizeOf(n: GNode) {
     const base = (3 + 15 * Math.sqrt(Math.max(n.score, 0))) * (TYPE_SIZE[n.type] ?? 1) * 1.3
     let s = Math.max(3.6, base)
@@ -576,7 +575,7 @@ export class BrainEngine {
 
   private colorConfig(): EdgeRendererColors {
     return {
-      getNodeColor: (t: string) => this.colors.node[t] ?? '#9fb3c8',
+      getNodeColor: (t: string) => this.colors.node[t] ?? typeColor(t),
       getEdgeColor: (t: string) => this.colors.edge[t] ?? '#4d6a88',
       bgColor: BG,
     }

@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from 'framer-motion'
 import { ArrowDownLeft, ArrowUpRight, ExternalLink, MessageCircleQuestion, Network, Orbit, Radar, Sparkles, X, Zap } from 'lucide-react'
 import { api, ApiError } from '@/lib/api'
 import { toast, useView } from '@/lib/store'
+import { typeColor } from '@/lib/palette'
 import type { EdgeDetail, NodeDetail } from '@/lib/types'
 import { Spinner } from '@/components/ui'
 import { clearAll, eng, expandNeighbors, focusEgo, playProcess, runImpact, selectEdge, selectNode } from '@/workspace/actions'
@@ -27,29 +28,35 @@ export function Drawer() {
   )
 }
 
-function useLoad<T>(fn: () => Promise<T>, deps: unknown[]) {
+function useLoad<T>(fn: (signal?: AbortSignal) => Promise<T>, deps: unknown[]) {
   const [data, setData] = useState<T | null>(null)
   const [err, setErr] = useState('')
   const [n, setN] = useState(0)
   useEffect(() => {
     let live = true
     setData(null); setErr('')
-    fn().then((d) => live && setData(d)).catch((e) => live && setErr(e instanceof ApiError ? e.message : 'Could not load details'))
-    return () => { live = false }
+    const ctl = new AbortController()
+    fn(ctl.signal).then((d) => live && setData(d)).catch((e) => {
+      if ((e as Error).name === 'AbortError') return
+      live && setErr(e instanceof ApiError ? e.message : 'Could not load details')
+    })
+    return () => {
+      live = false
+      ctl.abort()
+    }
   }, [...deps, n]) // eslint-disable-line react-hooks/exhaustive-deps
   return { data, err, retry: () => setN(n + 1) }
 }
 
 function NodePane({ id }: { id: string }) {
-  const { data: d, err, retry } = useLoad<NodeDetail>(() => api.node(eng.wsId, id), [id])
+  const { data: d, err, retry } = useLoad<NodeDetail>((signal) => api.node(eng.wsId, id, signal), [id])
   const [tab, setTab] = useState<Tab>('overview')
-  const colors = useView((s) => s.legend.node)
   const kind = useView((s) => s.kind)
   useEffect(() => setTab('overview'), [id])
   if (err) return <div className="p-6 pt-12 text-sm"><p className="text-coral">{err}</p><button className="btn btn-ghost btn-sm mt-3" onClick={retry}>Try again</button></div>
   if (!d) return <div className="space-y-3 p-5 pt-12">{[60, 100, 80, 90].map((w, i) => <div key={i} className="shimmer h-4 rounded" style={{ width: `${w}%` }} />)}</div>
   const isDocs = kind === 'docs'
-  const color = colors[d.type] ?? d.color ?? '#5cf2d6'
+  const color = typeColor(d.type)
   const isSymbol = ['Function', 'Method', 'Class', 'File'].includes(d.type)
   const relCount = Object.values(d.relations ?? {}).reduce((a, r) => a + r.in.length + r.out.length, 0)
   const allTabs: [Tab, string][] = [['overview', 'Overview'], ['content', d.code ? 'Code' : 'Text'], ['relations', `Links ${relCount}`], ['flows', 'Flows'], ['explain', 'Explain']]
@@ -149,7 +156,7 @@ function Explain({ id }: { id: string }) {
 }
 
 function EdgePane({ id }: { id: string }) {
-  const { data: e, err, retry } = useLoad<EdgeDetail>(() => api.edge(eng.wsId, id), [id])
+  const { data: e, err, retry } = useLoad<EdgeDetail>((signal) => api.edge(eng.wsId, id, signal), [id])
   if (err) return <div className="p-6 pt-12 text-sm"><p className="text-coral">{err}</p><button className="btn btn-ghost btn-sm mt-3" onClick={retry}>Try again</button></div>
   if (!e) return <div className="space-y-3 p-5 pt-12">{[70, 100, 60].map((w, i) => <div key={i} className="shimmer h-4 rounded" style={{ width: `${w}%` }} />)}</div>
   return (

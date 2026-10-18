@@ -1,5 +1,6 @@
 import { api, ApiError } from '@/lib/api'
 import { toast, useView } from '@/lib/store'
+import { NODE_COLORS, typeColor } from '@/lib/palette'
 import type { GLink, GNode, ProcessItem, WsEvent } from '@/lib/types'
 import type { BrainEngine } from '@/three/engine'
 
@@ -139,9 +140,11 @@ export async function loadGraph(wsId: string) {
     const g = await api.graph(wsId, { max_nodes: 4000 })
     eng.current?.setColors(g.legend?.node_colors, g.legend?.edge_colors)
     eng.current?.setData(g.nodes, g.links, g.clusters)
+    const nodeColors: Record<string, string> = { ...NODE_COLORS }
+    g.nodes.forEach((n) => { if (n.type && !nodeColors[n.type]) nodeColors[n.type] = typeColor(n.type) })
     patch({
       nodes: g.nodes, links: g.links, clusters: g.clusters, truncated: g.truncated, totalNodes: g.total_nodes,
-      legend: { node: g.legend?.node_colors ?? {}, edge: g.legend?.edge_colors ?? {} }, version: get().version + 1,
+      legend: { node: nodeColors, edge: g.legend?.edge_colors ?? {} }, version: get().version + 1,
     })
   } catch (e) { toast.error(msg(e, 'Could not load the graph')) }
 }
@@ -172,19 +175,20 @@ export function handleSocketEvent(ev: WsEvent) {
       streamNodes = []; streamLinks = []; streamClusters = ev.clusters
       clearAll()
       eng.current?.clear()
-      patch({ nodes: [], links: [], clusters: ev.clusters, ingest: { ...get().ingest, active: true, streamTotal: ev.nodes, streamed: 0 } })
+      patch({ nodes: [], links: [], clusters: ev.clusters, legend: { ...get().legend, node: { ...NODE_COLORS } }, ingest: { ...get().ingest, active: true, streamTotal: ev.nodes, streamed: 0 } })
       break
     case 'graph_batch': {
-      const links = ev.edges as unknown as GLink[]
-      eng.current?.addBatch(ev.nodes, links)
-      streamNodes.push(...ev.nodes); streamLinks.push(...links)
+      const links = (ev.edges || []) as unknown as GLink[]
+      const nodes = (ev.nodes || []) as unknown as GNode[]
+      eng.current?.addBatch(nodes, links)
+      streamNodes.push(...nodes); streamLinks.push(...links)
       patch({ ingest: { ...get().ingest, streamed: streamNodes.length } })
       break
     }
     case 'graph_ready':
       eng.current?.setClusters(streamClusters)
       eng.current?.clearFocusState()
-      patch({ nodes: streamNodes, links: streamLinks, clusters: streamClusters, totalNodes: streamNodes.length, version: get().version + 1 })
+      patch({ nodes: streamNodes, links: streamLinks, clusters: streamClusters, totalNodes: streamNodes.length, legend: { ...get().legend, node: { ...NODE_COLORS, ...Object.fromEntries(streamNodes.map((n) => [n.type, typeColor(n.type)])) } }, version: get().version + 1 })
       setTimeout(() => {
         eng.current?.frameGraph()
       }, 900)

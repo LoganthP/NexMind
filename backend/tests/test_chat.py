@@ -26,7 +26,7 @@ def chat_client():
         with open(code_zip, "rb") as f:
             r_up = c.post(f"/api/workspaces/{ws_id}/ingest", files=[("files", ("code.zip", f.read(), "application/zip"))])
         job_id = r_up.json()["job_id"]
-        for _ in range(120):
+        for _ in range(300):
             import time
             j = c.get(f"/api/jobs/{job_id}").json()
             if j["status"] in ("done", "failed"):

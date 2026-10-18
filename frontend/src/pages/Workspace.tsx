@@ -2,7 +2,8 @@ import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { ApiError, api } from '@/lib/api'
 import { connectWorkspaceSocket } from '@/lib/socket'
-import { toast, useView } from '@/lib/store'
+import { toast, useSettings, useView } from '@/lib/store'
+import { typeColor } from '@/lib/palette'
 import type { Workspace as Ws } from '@/lib/types'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { Aurora, Spinner } from '@/components/ui'
@@ -29,6 +30,7 @@ export default function Workspace() {
   const legend = useView((s) => s.legend.node)
   const nodes = useView((s) => s.nodes)
   const drawerOpen = useView((s) => s.drawerOpen)
+  const theme = useSettings((s) => s.theme)
 
   useEffect(() => {
     if (nodesCount > 0 && graphState !== 'ready') {
@@ -45,6 +47,7 @@ export default function Workspace() {
     let live = true
     const sock = connectWorkspaceSocket(id, handleSocketEvent, (c) => { if (c) sock.send({ type: 'ping' }) })
 
+    let poll: ReturnType<typeof setInterval> | null = null
     ;(async () => {
       try {
         const w = await api.workspace(id)
@@ -56,7 +59,12 @@ export default function Workspace() {
         patch({ threads, threadId: threads[0]?.id ?? null })
         if (w.status === 'ready') {
           await loadGraph(id)
-          if (live) setGraphState(useView.getState().nodes.length > 0 ? 'ready' : 'empty')
+          if (live) {
+            setGraphState(useView.getState().nodes.length > 0 ? 'ready' : 'empty')
+            if (useView.getState().nodes.length > 0 && !useView.getState().ingest.active) {
+              if (poll) clearInterval(poll)
+            }
+          }
         } else if (w.status === 'building') {
           patch({ ingest: { ...useView.getState().ingest, active: true, message: 'Working…' } })
         } else {
@@ -68,27 +76,36 @@ export default function Workspace() {
     })()
 
     // Safety net: if the live socket missed the end of a build, poll until the workspace is ready.
-    const poll = setInterval(async () => {
+    poll = setInterval(async () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+      const v = useView.getState()
+      if (v.nodes.length > 0 && !v.ingest.active) {
+        if (poll) clearInterval(poll)
+        return
+      }
       try {
         const w = await api.workspace(id)
         if (!live) return
         setWs(w)
         patch({ kind: w.kind || 'code', wsKind: w.kind || 'code' })
-        const v = useView.getState()
-        if (w.status === 'ready' && v.nodes.length === 0 && !v.ingest.active) {
+        const vNow = useView.getState()
+        if (w.status === 'ready' && vNow.nodes.length === 0 && !vNow.ingest.active) {
           setGraphState('loading')
           await loadGraph(id)
           if (live) setGraphState(useView.getState().nodes.length > 0 ? 'ready' : 'empty')
         }
-        if (w.status === 'ready' && v.ingest.active && v.ingest.phase !== 'stream' && v.ingest.percent < 100 && v.ingest.streamTotal === 0 && v.nodes.length === 0) {
-          patch({ ingest: { ...v.ingest, active: false } })
+        if (w.status === 'ready' && vNow.ingest.active && vNow.ingest.phase !== 'stream' && vNow.ingest.percent < 100 && vNow.ingest.streamTotal === 0 && vNow.nodes.length === 0) {
+          patch({ ingest: { ...vNow.ingest, active: false } })
           setGraphState('loading')
           await loadGraph(id)
           if (live) setGraphState(useView.getState().nodes.length > 0 ? 'ready' : 'empty')
         }
-        if (w.status === 'error' && v.ingest.active) {
-          patch({ ingest: { ...v.ingest, active: false, error: 'The build failed' } })
+        if (w.status === 'error' && vNow.ingest.active) {
+          patch({ ingest: { ...vNow.ingest, active: false, error: 'The build failed' } })
           if (live) setGraphState('empty')
+        }
+        if (useView.getState().nodes.length > 0 && !useView.getState().ingest.active) {
+          if (poll) clearInterval(poll)
         }
       } catch { /* server hiccup: the shell shows its own banner */ }
     }, 3000)
@@ -100,7 +117,7 @@ export default function Workspace() {
       if (e.key === 'i') { const s = useView.getState().selectedId; if (s) void runImpact(s) }
     }
     window.addEventListener('keydown', onKey)
-    return () => { live = false; clearInterval(poll); sock.close(); window.removeEventListener('keydown', onKey); clearAll(); useView.getState().reset() }
+    return () => { live = false; if (poll) clearInterval(poll); sock.close(); window.removeEventListener('keydown', onKey); clearAll(); useView.getState().reset() }
   }, [id])
 
   const counts = nodes.reduce<Record<string, number>>((a, n) => { a[n.type] = (a[n.type] ?? 0) + 1; return a }, {})
@@ -190,9 +207,16 @@ export default function Workspace() {
       {nodesCount > 0 && !drawerOpen && (
         <div className="glass pointer-events-none absolute right-3 top-[4.9rem] z-20 hidden w-44 rounded-2xl p-3 text-xs xl:block" aria-label="Legend">
           <div className="mono mb-2 text-mist">{nodesCount.toLocaleString()} nodes · {useView.getState().links.length.toLocaleString()} links</div>
-          {Object.keys(counts).sort((a, b) => counts[b] - counts[a]).slice(0, 9).map((t) => (
-            <div key={t} className="flex items-center gap-2 py-0.5"><i className="h-2 w-2 rounded-full" style={{ background: legend[t] ?? '#5cf2d6', boxShadow: `0 0 6px ${legend[t] ?? '#5cf2d6'}` }} /><span>{t}</span><span className="ml-auto text-mist">{counts[t]}</span></div>
-          ))}
+          {Object.keys(counts).sort((a, b) => counts[b] - counts[a]).slice(0, 9).map((t) => {
+            const col = typeColor(t, theme === 'light' ? 'light' : 'dark')
+            return (
+              <div key={t} className="flex items-center gap-2 py-0.5" data-testid={`legend-${t}`}>
+                <i className="h-2 w-2 rounded-full" style={{ background: col, boxShadow: `0 0 6px ${col}` }} data-testid={`legend-dot-${t}`} />
+                <span>{t}</span>
+                <span className="ml-auto text-mist">{counts[t]}</span>
+              </div>
+            )
+          })}
           {truncated && <div className="mt-2 text-amber">Showing the {nodesCount.toLocaleString()} most important of {totalNodes.toLocaleString()}</div>}
         </div>
       )}

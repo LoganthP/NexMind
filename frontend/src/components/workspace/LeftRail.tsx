@@ -3,7 +3,8 @@ import { AnimatePresence, motion } from 'framer-motion'
 import { useShallow } from 'zustand/react/shallow'
 import { Check, ChevronRight, FileText, Filter, Folder, FolderTree, Lightbulb, MessageSquare, PanelLeftClose, PanelLeftOpen, Pencil, Plus, RefreshCw, Trash2, Workflow, X } from 'lucide-react'
 import { api, ApiError } from '@/lib/api'
-import { toast, useView, type Panel } from '@/lib/store'
+import { toast, useSettings, useView, type Panel } from '@/lib/store'
+import { typeColor } from '@/lib/palette'
 import type { Insight, ProcessItem, SourceItem, TreeNode } from '@/lib/types'
 import { AnalyzePanel } from '@/components/AnalyzePanel'
 import { Spinner } from '@/components/ui'
@@ -188,7 +189,8 @@ function FlowsPanel() {
 
 // ---------------------------------------------------------------- filters
 function FiltersPanel() {
-  const { nodes, clusters, legend, hiddenTypes, hiddenClusters, minScore } = useView(useShallow((s) => ({ nodes: s.nodes, clusters: s.clusters, legend: s.legend.node, hiddenTypes: s.hiddenTypes, hiddenClusters: s.hiddenClusters, minScore: s.minScore })))
+  const { nodes, clusters, hiddenTypes, hiddenClusters, minScore } = useView(useShallow((s) => ({ nodes: s.nodes, clusters: s.clusters, hiddenTypes: s.hiddenTypes, hiddenClusters: s.hiddenClusters, minScore: s.minScore })))
+  const theme = useSettings((s) => s.theme)
   const patch = useView.getState().patch
   const counts = nodes.reduce<Record<string, number>>((a, n) => { a[n.type] = (a[n.type] ?? 0) + 1; return a }, {})
   const toggleType = (t: string) => { const s = new Set(hiddenTypes); s.has(t) ? s.delete(t) : s.add(t); patch({ hiddenTypes: s }) }
@@ -200,7 +202,7 @@ function FiltersPanel() {
       <div className="flex flex-wrap gap-1.5">
         {Object.keys(counts).sort().map((t) => (
           <button key={t} className={`chip hover:text-ink ${hiddenTypes.has(t) ? 'opacity-40 line-through' : ''}`} aria-pressed={!hiddenTypes.has(t)} onClick={() => toggleType(t)}>
-            <i className="h-2 w-2 rounded-full" style={{ background: legend[t] ?? '#5cf2d6' }} />{t} <span className="text-[0.65rem]">{counts[t]}</span>
+            <i className="h-2 w-2 rounded-full" style={{ background: typeColor(t, theme === 'light' ? 'light' : 'dark') }} />{t} <span className="text-[0.65rem]">{counts[t]}</span>
           </button>
         ))}
       </div>

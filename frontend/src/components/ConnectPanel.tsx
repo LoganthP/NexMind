@@ -33,32 +33,49 @@ export function ConnectPanel({ onSuccess, onClose }: Props) {
   useEffect(() => {
     let active = true
 
+    const poll = async () => {
+      if (!active) return
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        return
+      }
+      try {
+        const data = await api.connectSessions(startTimestampRef.current)
+        if (!active) return
+        if (data.sessions && data.sessions.length > 0) {
+          const latest = data.sessions[data.sessions.length - 1]
+          setConnectedSession(latest)
+          setTimeout(() => {
+            if (onSuccess) onSuccess(latest.workspace_id)
+            else nav(`/app/w/${latest.workspace_id}`)
+          }, 1200)
+          return
+        }
+      } catch {
+        // Polling error silently handled
+      }
+      if (active) {
+        timerRef.current = setTimeout(poll, 1500)
+      }
+    }
+
+    const onVisChange = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible' && active) {
+        clearTimeout(timerRef.current)
+        void poll()
+      } else {
+        clearTimeout(timerRef.current)
+      }
+    }
+
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onVisChange)
+    }
+
     api
       .connectSessions(0)
       .then((res) => {
         if (!active) return
         startTimestampRef.current = res.now || Date.now() / 1000
-
-        const poll = async () => {
-          if (!active) return
-          try {
-            const data = await api.connectSessions(startTimestampRef.current)
-            if (!active) return
-            if (data.sessions && data.sessions.length > 0) {
-              const latest = data.sessions[data.sessions.length - 1]
-              setConnectedSession(latest)
-              setTimeout(() => {
-                if (onSuccess) onSuccess(latest.workspace_id)
-                else nav(`/app/w/${latest.workspace_id}`)
-              }, 1200)
-              return
-            }
-          } catch {
-            // Polling error silently handled
-          }
-          timerRef.current = setTimeout(poll, 1500)
-        }
-
         timerRef.current = setTimeout(poll, 1500)
       })
       .catch(() => {
@@ -68,6 +85,9 @@ export function ConnectPanel({ onSuccess, onClose }: Props) {
     return () => {
       active = false
       if (timerRef.current) clearTimeout(timerRef.current)
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVisChange)
+      }
     }
   }, [nav, onSuccess])
 

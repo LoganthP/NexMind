@@ -44,12 +44,14 @@ app = FastAPI(
 )
 import inspect
 
+from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.cors import CORSMiddleware as _CORS
 
-_cors_kwargs = dict(allow_origins=settings.cors_origins, allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
+_cors_kwargs = dict(allow_origins=settings.cors_origins, allow_credentials=False, allow_methods=["*"], allow_headers=["*"], max_age=86400)
 _native_pna = "allow_private_network" in inspect.signature(_CORS.__init__).parameters
 if _native_pna:  # newer Starlette answers Chrome's private-network preflight itself
     _cors_kwargs["allow_private_network"] = True
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(CORSMiddleware, **_cors_kwargs)
 
 

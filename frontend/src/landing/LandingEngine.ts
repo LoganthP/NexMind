@@ -9,20 +9,8 @@ type FG = any
 export const BG = '#040a12'
 export const FOG_DENSITY = 0.0012
 
-export const NODE_COLORS: Record<string, string> = {
-  Source: '#f4f8ff',
-  Folder: '#7f93ad',
-  File: '#4cc9f0',
-  Document: '#ffb35c',
-  Section: '#ffd199',
-  Class: '#a99bff',
-  Function: '#5cf2d6',
-  Method: '#8ff7e4',
-  Module: '#ff7eb6',
-  Concept: '#ffd666',
-  Entity: '#ff8a8a',
-  Process: '#38e8ff',
-}
+import { NODE_COLORS, typeColor } from '@/lib/palette'
+export { NODE_COLORS }
 
 export const EDGE_COLORS: Record<string, string> = {
   CONTAINS: '#3d546d',
@@ -362,7 +350,7 @@ export class LandingEngine {
   }
 
   private nodeColor(n: GNode): string {
-    return NODE_COLORS[n.type] ?? '#9fb3c8'
+    return typeColor(n.type)
   }
 
   private sizeOf(n: GNode): number {
