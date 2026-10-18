@@ -65,7 +65,7 @@ class Settings:
         ]
     )
     allow_local_paths: bool = _bool("NEXMIND_ALLOW_LOCAL_PATHS", True)  # index folders on this machine in place
-    web_url: str = os.environ.get("NEXMIND_WEB_URL", "http://localhost:5173")  # where your frontend lives (printed by `nexmind serve`)
+    web_url: str = os.environ.get("FRONTEND_URL") or os.environ.get("NEXMIND_WEB_URL", "http://localhost:5173")  # where your frontend lives (printed by `nexmind serve`)
     git_timeout_s: int = _int("NEXMIND_GIT_TIMEOUT", 180)
 
     # --- graph / analysis ---

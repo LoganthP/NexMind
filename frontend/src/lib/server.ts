@@ -16,7 +16,14 @@ function candidates(): string[] {
   if (base && base !== DEFAULT_API && base !== 'http://localhost:8000') {
     return [base]
   }
-  const list = [base, DEFAULT_API, 'http://localhost:8000', 'http://127.0.0.1:8001', 'http://127.0.0.1:8765']
+  const origin =
+    typeof window !== 'undefined' &&
+    window.location?.origin &&
+    !window.location.origin.startsWith('file:') &&
+    !window.location.port.includes('5173')
+      ? window.location.origin
+      : ''
+  const list = [origin, base, DEFAULT_API, 'http://localhost:8000', 'http://127.0.0.1:8001', 'http://127.0.0.1:8765'].filter(Boolean)
   return [...new Set(list)]
 }
 
