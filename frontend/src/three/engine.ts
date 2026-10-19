@@ -1,6 +1,7 @@
 import ForceGraph3D from '3d-force-graph'
 import * as THREE from 'three'
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js'
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js'
 import type { Cluster, GLink, GNode } from '@/lib/types'
 import { EdgeRenderer, type EdgeRendererColors } from './edges'
 import { relax } from './relax'
@@ -9,6 +10,23 @@ import { releasePivot, clampTarget, CameraGuard, shouldRunMove, shouldRestore, t
 
 import { NODE_COLORS, typeColor } from '@/lib/palette'
 export { NODE_COLORS }
+
+// Brightness tuning
+export const DEFAULT_GLOW = 0
+export const MAX_GLOW_STRENGTH = 0.35
+export const GLOW_THRESHOLD = 0.8
+export const GLOW_RADIUS = 0.3
+export const RENDERER_TONE_MAPPING_EXPOSURE = 0.9
+export const NODE_CORE_OPACITY = 0.92
+export const NODE_HALO_RADIUS_MULT = 1.2
+export const NODE_HALO_MAX_ALPHA = 0.12
+export const NODE_HIGHLIGHT_WHITE_LERP = 0.25
+export const EDGE_REST_OPACITY = 0.16
+export const EDGE_REST_OPACITY_DENSE = 0.12
+export const EDGE_DENSE_THRESHOLD = 3000
+export const EDGE_BG_MIX = 0.45
+export const CLUSTER_HAZE_OPACITY = 0.02
+export const DUST_OPACITY = 0.08
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type FG = any
@@ -39,6 +57,7 @@ export interface EngineOptions {
   labels?: boolean
   ambient?: boolean
   events?: EngineEvents
+  glow?: number
 }
 export interface Emphasis { nodes: Set<string>; edges: Set<string> }
 interface Ring { sprite: THREE.Sprite; t0: number; dur: number; max: number }
@@ -52,19 +71,19 @@ function nodeTexture(): THREE.CanvasTexture {
   const g = c.getContext('2d')!
   const cx = 128, cy = 128
   const rCore = 68 // about 55% of the radius
-  const rHalo = Math.round(rCore * 1.35) // at most 1.35x core radius
+  const rHalo = Math.round(rCore * NODE_HALO_RADIUS_MULT) // at most 1.2x core radius
 
-  // 1. Soft halo (alpha at most 0.25 down to 0)
+  // 1. Soft halo (alpha at most 0.12 down to 0)
   const haloGrad = g.createRadialGradient(cx, cy, rCore, cx, cy, rHalo)
-  haloGrad.addColorStop(0, 'rgba(255,255,255,0.25)')
+  haloGrad.addColorStop(0, `rgba(255,255,255,${NODE_HALO_MAX_ALPHA})`)
   haloGrad.addColorStop(1, 'rgba(255,255,255,0)')
   g.fillStyle = haloGrad
   g.beginPath()
   g.arc(cx, cy, rHalo, 0, Math.PI * 2)
   g.fill()
 
-  // 2. Brighter solid core (about 55% of radius)
-  g.fillStyle = 'rgba(255,255,255,1)'
+  // 2. Solid core (opacity 0.92)
+  g.fillStyle = `rgba(255,255,255,${NODE_CORE_OPACITY})`
   g.beginPath()
   g.arc(cx, cy, rCore, 0, Math.PI * 2)
   g.fill()
@@ -191,6 +210,7 @@ export class BrainEngine {
   private nebulaTex: THREE.CanvasTexture
   private dust: THREE.Points | null = null
   private bloom: UnrealBloomPass | null = null
+  private outputPass: OutputPass | null = null
   private raf = 0
   private disposed = false
   private last = performance.now()
@@ -244,7 +264,7 @@ export class BrainEngine {
     this.ev = options.events ?? {}
     this.opts = {
       interactive: options.interactive ?? true, quality: options.quality ?? 'high', autoRotate: options.autoRotate ?? true,
-      labels: options.labels ?? true, ambient: options.ambient ?? true,
+      labels: options.labels ?? true, ambient: options.ambient ?? true, glow: options.glow ?? DEFAULT_GLOW,
     }
     this.nodeTex = nodeTexture()
     this.ringTex = ringTexture()
@@ -256,11 +276,16 @@ export class BrainEngine {
       .nodeLabel(() => '').linkLabel(() => '').enableNodeDrag(false)
       .nodeThreeObjectExtend(false).nodeThreeObject((n: GNode) => this.makeNode(n))
       .linkVisibility(() => false) // Hide library's own links; EdgeRenderer draws edges with 2 LineSegments
+      .linkDirectionalParticles(() => 0) // No directional particles at rest
       .linkHoverPrecision(5)
 
     // Distance fog: FogExp2 density set to 0.00025 to keep far nodes and edges clear
     fg.scene().fog = new THREE.FogExp2(new THREE.Color(BG).getHex(), 0.00025)
-    fg.renderer().setPixelRatio(Math.min(window.devicePixelRatio || 1, low ? 1.25 : 2))
+    const renderer = fg.renderer() as THREE.WebGLRenderer
+    renderer.outputColorSpace = THREE.SRGBColorSpace
+    renderer.toneMapping = THREE.ACESFilmicToneMapping
+    renderer.toneMappingExposure = RENDERER_TONE_MAPPING_EXPOSURE
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, low ? 1.25 : 2))
     fg.camera().far = 6000; fg.camera().updateProjectionMatrix()
     fg.cameraPosition({ x: 0, y: 60, z: 520 })
 
@@ -307,11 +332,24 @@ export class BrainEngine {
         this.pauseRotate()
       })
     }
-    if (!low) {
-      try {
-        this.bloom = new UnrealBloomPass(new THREE.Vector2(el.clientWidth || 800, el.clientHeight || 600), 0.9, 0.55, 0.04)
-        fg.postProcessingComposer().addPass(this.bloom)
-      } catch { this.bloom = null }
+    try {
+      const composer = fg.postProcessingComposer()
+      if (this.opts.glow > 0 && !low) {
+        this.bloom = new UnrealBloomPass(
+          new THREE.Vector2(el.clientWidth || 800, el.clientHeight || 600),
+          Math.min(this.opts.glow, MAX_GLOW_STRENGTH),
+          GLOW_RADIUS,
+          GLOW_THRESHOLD
+        )
+        composer.addPass(this.bloom)
+      } else {
+        this.bloom = null
+      }
+      this.outputPass = new OutputPass()
+      composer.addPass(this.outputPass)
+    } catch {
+      this.bloom = null
+      this.outputPass = null
     }
     this.addDust()
     this.onMove = (e) => { const r = el.getBoundingClientRect(); this.pointer = { x: e.clientX - r.left, y: e.clientY - r.top } }
@@ -1049,7 +1087,7 @@ export class BrainEngine {
   }
   ring(id: string, max = 70, dur = 1100, color?: string) {
     const n = this.byId.get(id); if (!n) return
-    const mat = new THREE.SpriteMaterial({ map: this.ringTex, color: color ?? this.nodeColor(n), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, opacity: 0.9 })
+    const mat = new THREE.SpriteMaterial({ map: this.ringTex, color: color ?? this.nodeColor(n), transparent: true, depthWrite: false, blending: THREE.NormalBlending, opacity: 0.9 })
     const s = new THREE.Sprite(mat); s.position.set(n.x, n.y, n.z); s.scale.setScalar(1)
     this.fg.scene().add(s)
     this.rings.push({ sprite: s, t0: performance.now(), dur, max })
@@ -1091,10 +1129,46 @@ export class BrainEngine {
     this.timers.add(t)
   }
 
+  setGlow(v: number) {
+    this.opts.glow = v
+    const low = this.opts.quality === 'low'
+    if (v > 0 && !low) {
+      const strength = Math.min(v, MAX_GLOW_STRENGTH)
+      if (!this.bloom) {
+        try {
+          const composer = this.fg.postProcessingComposer()
+          this.bloom = new UnrealBloomPass(
+            new THREE.Vector2(this.el.clientWidth || 800, this.el.clientHeight || 600),
+            strength,
+            GLOW_RADIUS,
+            GLOW_THRESHOLD
+          )
+          if (this.outputPass && composer.passes.includes(this.outputPass)) {
+            const idx = composer.passes.indexOf(this.outputPass)
+            composer.passes.splice(idx, 0, this.bloom)
+          } else {
+            composer.addPass(this.bloom)
+          }
+        } catch {
+          this.bloom = null
+        }
+      } else {
+        this.bloom.strength = strength
+        this.bloom.radius = GLOW_RADIUS
+        this.bloom.threshold = GLOW_THRESHOLD
+        this.bloom.enabled = true
+      }
+    } else {
+      if (this.bloom) {
+        this.bloom.enabled = false
+      }
+    }
+  }
+
   setQuality(q: 'high' | 'low') {
     this.opts.quality = q
     const low = q === 'low'
-    if (this.bloom) this.bloom.enabled = !low
+    if (this.bloom) this.bloom.enabled = !low && (this.opts.glow > 0)
     this.fg.renderer().setPixelRatio(Math.min(window.devicePixelRatio || 1, low ? 1.25 : 2))
     this.updateEdgeBase()
   }
@@ -1108,7 +1182,7 @@ export class BrainEngine {
       pos[i * 3] = r * Math.sin(ph) * Math.cos(th); pos[i * 3 + 1] = r * Math.sin(ph) * Math.sin(th); pos[i * 3 + 2] = r * Math.cos(ph)
     }
     const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pos, 3))
-    const m = new THREE.PointsMaterial({ map: this.nebulaTex, size: 5, color: '#7aa8d6', transparent: true, opacity: 0.32, depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true })
+    const m = new THREE.PointsMaterial({ map: this.nebulaTex, size: 5, color: '#7aa8d6', transparent: true, opacity: DUST_OPACITY, depthWrite: false, blending: THREE.NormalBlending, sizeAttenuation: true })
     this.dust = new THREE.Points(g, m)
     this.fg.scene().add(this.dust)
   }
@@ -1124,7 +1198,7 @@ export class BrainEngine {
       const ms = groups.get(c.id); if (!ms || ms.length < 3) continue
       const ctr = new THREE.Vector3(); ms.forEach((m) => ctr.add(new THREE.Vector3(m.x, m.y, m.z))); ctr.divideScalar(ms.length)
       let rms = 0; ms.forEach((m) => { rms += ctr.distanceToSquared(new THREE.Vector3(m.x, m.y, m.z)) }); rms = Math.sqrt(rms / ms.length)
-      const mat = new THREE.SpriteMaterial({ map: this.nebulaTex, color: c.color, transparent: true, opacity: 0.085, depthWrite: false, blending: THREE.AdditiveBlending })
+      const mat = new THREE.SpriteMaterial({ map: this.nebulaTex, color: c.color, transparent: true, opacity: CLUSTER_HAZE_OPACITY, depthWrite: false, blending: THREE.NormalBlending })
       const neb = new THREE.Sprite(mat); neb.position.copy(ctr); neb.scale.setScalar(Math.max(60, rms * 4.2)); neb.renderOrder = -1
       this.fg.scene().add(neb); this.decor.push(neb)
       if (this.opts.labels) {
@@ -1218,11 +1292,11 @@ export class BrainEngine {
       const effBase = Math.max(ud.base, minWorldSize)
 
       // Node opacity:
-      // Rest: final opacity at least 0.95 (0.98)
-      // Focused: hovered/selected node + direct neighbours stay 1.0; other nodes drop to 0.08
+      // Rest: solid core at opacity 0.92
+      // Focused: hovered/selected node + direct neighbours stay 0.92; other nodes drop to 0.08
       const isFocusedNode = emph ? emph.nodes.has(n.id) : false
-      const restAlpha = hidden ? 0 : 0.98
-      const focusedAlpha = hidden ? 0 : (isFocusedNode ? 1.0 : 0.08)
+      const restAlpha = hidden ? 0 : NODE_CORE_OPACITY
+      const focusedAlpha = hidden ? 0 : (isFocusedNode ? NODE_CORE_OPACITY : 0.08)
       const targetAlpha = restAlpha + (focusedAlpha - restAlpha) * this.focusAmount
       ud.alpha += (targetAlpha - ud.alpha) * Math.min(1, dt * 12)
 
@@ -1236,7 +1310,18 @@ export class BrainEngine {
 
       const mat = o.material as THREE.SpriteMaterial
       mat.opacity = ud.alpha * clamp(0.35 + grow, 0, 1)
-      if (ud.flash > 0.02) mat.color.copy(ud.col).lerp(new THREE.Color('#ffffff'), Math.min(0.7, ud.flash * 0.6)); else mat.color.copy(ud.col)
+
+      let whiteLerp = 0
+      if (isHov || isSel) {
+        whiteLerp = Math.max(whiteLerp, NODE_HIGHLIGHT_WHITE_LERP)
+      }
+      if (ud.flash > 0.02) {
+        whiteLerp = Math.max(whiteLerp, Math.min(NODE_HIGHLIGHT_WHITE_LERP, ud.flash * NODE_HIGHLIGHT_WHITE_LERP))
+      }
+      mat.color.copy(ud.col)
+      if (whiteLerp > 0) {
+        mat.color.lerp(new THREE.Color('#ffffff'), whiteLerp)
+      }
       o.visible = mat.opacity > 0.015
 
       // Labels:
@@ -1270,7 +1355,7 @@ export class BrainEngine {
     // Fade cluster nebulae during focus
     for (const o of this.decor) {
       const m = (o as THREE.Sprite).material as THREE.SpriteMaterial
-      const targetOp = this.emph ? 0.015 : 0.085
+      const targetOp = this.emph ? 0.005 : CLUSTER_HAZE_OPACITY
       m.opacity += (targetOp - m.opacity) * Math.min(1, dt * 8)
     }
 
@@ -1326,6 +1411,8 @@ export class BrainEngine {
     this.el.removeEventListener('pointerdown', this.onUserActivity)
     this.edgeRenderer.dispose(this.fg.scene())
     try { this.fg.pauseAnimation(); this.fg._destructor?.() } catch { /* already gone */ }
+    this.outputPass?.dispose()
+    this.bloom?.dispose()
     this.nodeTex.dispose(); this.ringTex.dispose(); this.nebulaTex.dispose()
     this.el.innerHTML = ''
   }

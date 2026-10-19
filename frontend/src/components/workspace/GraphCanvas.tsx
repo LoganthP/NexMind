@@ -6,7 +6,7 @@ import { applyFilters, clearAll, eng, selectEdge, selectNode } from '@/workspace
 export function GraphCanvas() {
   const ref = useRef<HTMLDivElement>(null)
   const [failed, setFailed] = useState('')
-  const { perf, autoRotate, set } = useSettings()
+  const { perf, autoRotate, glow, set } = useSettings()
   const hiddenTypes = useView((s) => s.hiddenTypes)
   const hiddenClusters = useView((s) => s.hiddenClusters)
   const minScore = useView((s) => s.minScore)
@@ -18,7 +18,9 @@ export function GraphCanvas() {
     let engine: BrainEngine
     try {
       engine = new BrainEngine(el, {
-        quality: useSettings.getState().perf ? 'low' : 'high', autoRotate: useSettings.getState().autoRotate,
+        quality: useSettings.getState().perf ? 'low' : 'high',
+        autoRotate: useSettings.getState().autoRotate,
+        glow: useSettings.getState().glow,
         events: {
           onHover: (id, pos) => patch({ hoverId: id, hoverPos: pos }),
           onClick: (id) => selectNode(id),
@@ -64,6 +66,7 @@ export function GraphCanvas() {
 
   useEffect(() => { eng.current?.setQuality(perf ? 'low' : 'high') }, [perf])
   useEffect(() => { eng.current?.setAutoRotate(autoRotate) }, [autoRotate])
+  useEffect(() => { eng.current?.setGlow(glow) }, [glow])
   useEffect(() => { applyFilters() }, [hiddenTypes, hiddenClusters, minScore])
 
   if (failed) {

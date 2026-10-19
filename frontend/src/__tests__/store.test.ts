@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
-import { useSettings, useToasts, toast, useView } from '@/lib/store'
+import { useSettings, useToasts, toast, useView, loadSettings, SETTINGS_VERSION } from '@/lib/store'
 
 describe('Zustand stores and toasts', () => {
   beforeEach(() => {
@@ -16,6 +16,18 @@ describe('Zustand stores and toasts', () => {
       const saved = JSON.parse(localStorage.getItem('nexmind.settings') || '{}')
       expect(saved.solid).toBe(true)
       expect(saved.theme).toBe('graphite')
+    })
+
+    it('default settings have glow 0', () => {
+      expect(useSettings.getState().glow).toBe(0)
+    })
+
+    it('stored legacy settings object with glow 1.0 is reset by the migration', () => {
+      localStorage.setItem('nexmind.settings', JSON.stringify({ glow: 1.0, perf: true }))
+      const migrated = loadSettings()
+      expect(migrated.glow).toBe(0)
+      expect(migrated.perf).toBe(false)
+      expect(migrated.version).toBe(SETTINGS_VERSION)
     })
   })
 

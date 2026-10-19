@@ -1,5 +1,11 @@
 import * as THREE from 'three'
 import type { GLink, GNode } from '@/lib/types'
+import {
+  EDGE_REST_OPACITY,
+  EDGE_REST_OPACITY_DENSE,
+  EDGE_DENSE_THRESHOLD,
+  EDGE_BG_MIX,
+} from './engine'
 
 // Pre-computed quadratic Bezier weights for 5 segments (t = 0, 0.2, 0.4, 0.6, 0.8, 1.0)
 const W = [
@@ -37,9 +43,9 @@ export class EdgeRenderer {
   private hlPositions: Float32Array = new Float32Array(0)
   private hlColors: Float32Array = new Float32Array(0)
 
-  private currentBaseOpacity = 0.32
-  private targetBaseOpacity = 0.32
-  private restBaseOpacity = 0.32
+  private currentBaseOpacity = EDGE_REST_OPACITY
+  private targetBaseOpacity = EDGE_REST_OPACITY
+  private restBaseOpacity = EDGE_REST_OPACITY
   private baseEdgeCount = 0
 
   private bgCol = new THREE.Color('#040a12')
@@ -49,15 +55,16 @@ export class EdgeRenderer {
   constructor(scene: THREE.Scene, bgColor = '#040a12') {
     this.bgCol.set(bgColor)
 
-    // 1. BASE group (quiet, base opacity 0.32, vertexColors enabled)
+    // 1. BASE group (quiet, base opacity 0.16/0.12, vertexColors enabled)
     const baseGeo = new THREE.BufferGeometry()
     baseGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(0), 3))
     baseGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(0), 3))
     this.baseMat = new THREE.LineBasicMaterial({
       vertexColors: true,
       transparent: true,
-      opacity: 0.32,
+      opacity: EDGE_REST_OPACITY,
       depthWrite: false,
+      blending: THREE.NormalBlending,
       fog: false,
     })
     this.baseMesh = new THREE.LineSegments(baseGeo, this.baseMat)
@@ -73,6 +80,7 @@ export class EdgeRenderer {
       transparent: true,
       opacity: 1.0,
       depthWrite: false,
+      blending: THREE.NormalBlending,
       fog: false,
     })
     this.highlightMesh = new THREE.LineSegments(hlGeo, this.hlMat)
@@ -115,8 +123,8 @@ export class EdgeRenderer {
     emphEdges?: Set<string>
   ): void {
     this.baseEdgeCount = links.length
-    // Base opacity 0.32 (0.24 when edges > 3000)
-    this.restBaseOpacity = links.length > 3000 ? 0.24 : 0.32
+    // Base opacity 0.16 (0.12 when edges > 3000)
+    this.restBaseOpacity = links.length > EDGE_DENSE_THRESHOLD ? EDGE_REST_OPACITY_DENSE : EDGE_REST_OPACITY
     if (this.targetBaseOpacity !== 0.03) {
       this.targetBaseOpacity = this.restBaseOpacity
     }
@@ -160,17 +168,10 @@ export class EdgeRenderer {
       const sNode = nodesById.get(sId)!
       const tNode = nodesById.get(tId)!
 
-      // Colour = source node type colour mixed only 20% toward background,
-      // then clamp HSL lightness to at least 55%
+      // Colour = source node type colour mixed 45% toward background
       let c = this.cachedNodeColors.get(sNode.type)
       if (!c) {
-        c = new THREE.Color(colors.getNodeColor(sNode.type)).lerp(this.bgCol, 0.20)
-        const hsl = { h: 0, s: 0, l: 0 }
-        c.getHSL(hsl)
-        if (hsl.l < 0.55) {
-          hsl.l = 0.55
-          c.setHSL(hsl.h, hsl.s, hsl.l)
-        }
+        c = new THREE.Color(colors.getNodeColor(sNode.type)).lerp(this.bgCol, EDGE_BG_MIX)
         this.cachedNodeColors.set(sNode.type, c)
       }
 

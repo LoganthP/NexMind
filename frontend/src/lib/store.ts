@@ -2,26 +2,67 @@ import { create } from 'zustand'
 import type { Activation, Cluster, GNode, GLink, ImpactResult, ProcessItem, Thread, TraceResult } from './types'
 
 // ---------------------------------------------------------------- settings (persisted)
-interface SettingsState {
+export const SETTINGS_VERSION = 2
+export const SKEY = 'nexmind.settings'
+
+export interface SettingsValues {
   solid: boolean      // swap frosted glass for solid, high-contrast surfaces
   perf: boolean       // no bloom / particles / curved edges
   autoRotate: boolean
   theme: 'light' | 'dark' | 'graphite'
+  glow: number        // 0 = off, capped at 0.35
+  version: number
+}
+
+export interface SettingsState extends SettingsValues {
   set: (p: Partial<Omit<SettingsState, 'set'>>) => void
 }
-const SKEY = 'nexmind.settings'
-function loadSettings(): Pick<SettingsState, 'solid' | 'perf' | 'autoRotate' | 'theme'> {
+
+export function loadSettings(): SettingsValues {
   const prefersSolid = typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-transparency: reduce)').matches
   const prefersCalm = typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches
-  const base = { solid: prefersSolid, perf: false, autoRotate: !prefersCalm, theme: 'dark' as const }
-  try { return { ...base, ...JSON.parse(localStorage.getItem(SKEY) || '{}') } } catch { return base }
+  const base: SettingsValues = {
+    solid: prefersSolid,
+    perf: false,
+    autoRotate: !prefersCalm,
+    theme: 'dark' as const,
+    glow: 0,
+    version: SETTINGS_VERSION,
+  }
+  try {
+    const raw = localStorage.getItem(SKEY)
+    if (!raw) return base
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || parsed.version !== SETTINGS_VERSION) {
+      // Stored values from older builds or other domains are reset to the new defaults (glow 0, performance mode off)
+      const migrated: SettingsValues = {
+        ...base,
+        solid: typeof parsed?.solid === 'boolean' ? parsed.solid : base.solid,
+        autoRotate: typeof parsed?.autoRotate === 'boolean' ? parsed.autoRotate : base.autoRotate,
+        theme: parsed?.theme === 'light' || parsed?.theme === 'graphite' ? parsed.theme : base.theme,
+        glow: 0,
+        perf: false,
+        version: SETTINGS_VERSION,
+      }
+      try { localStorage.setItem(SKEY, JSON.stringify(migrated)) } catch { /* ignore */ }
+      return migrated
+    }
+    return {
+      ...base,
+      ...parsed,
+      glow: typeof parsed.glow === 'number' ? Math.min(Math.max(parsed.glow, 0), 0.35) : 0,
+    }
+  } catch {
+    return base
+  }
 }
+
 export const useSettings = create<SettingsState>((set, get) => ({
   ...loadSettings(),
   set: (p) => {
     set(p)
-    const { solid, perf, autoRotate, theme } = get()
-    try { localStorage.setItem(SKEY, JSON.stringify({ solid, perf, autoRotate, theme })) } catch { /* ignore */ }
+    const { solid, perf, autoRotate, theme, glow, version } = get()
+    try { localStorage.setItem(SKEY, JSON.stringify({ solid, perf, autoRotate, theme, glow, version })) } catch { /* ignore */ }
     document.documentElement.dataset.solid = String(solid)
   },
 }))
