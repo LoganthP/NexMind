@@ -397,21 +397,3 @@ Git is required for GitHub / GitLab / Azure DevOps imports. Run `nexmind doctor`
 </details>
 
 <img src="assets/divider.svg" width="100%" alt=""/>
-
-## 👤 Author
-
-<div align="center">
-
-**Loganth P**
-
-<a href="https://github.com/LoganthP"><img src="https://img.shields.io/badge/GitHub-LoganthP-181717?style=for-the-badge&logo=github&logoColor=white" alt="GitHub"/></a>
-<a href="https://www.linkedin.com/in/loganth-p-158667280/"><img src="https://img.shields.io/badge/LinkedIn-Loganth%20P-0A66C2?style=for-the-badge&logo=linkedin&logoColor=white" alt="LinkedIn"/></a>
-<a href="mailto:loganthp55@gmail.com"><img src="https://img.shields.io/badge/Email-loganthp55%40gmail.com-EA4335?style=for-the-badge&logo=gmail&logoColor=white" alt="Email"/></a>
-
-<br/><br/>
-
-⭐ **If NexMind helps you understand a codebase faster, consider giving it a star!** ⭐
-
-<img src="https://capsule-render.vercel.app/api?type=waving&color=0:22d3ee,50:818cf8,100:e879f9&height=120&section=footer" width="100%" alt=""/>
-
-</div>
