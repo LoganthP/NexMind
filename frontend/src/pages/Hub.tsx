@@ -18,11 +18,7 @@ const STATUS: Record<Workspace['status'], { label: string; cls: string }> = {
 
 export default function Hub() {
   const nav = useNavigate()
-  const status = useServer((s) => s.status)
-  const connected = useServer((s) => s.connected || s.status === 'online')
-  const isServerOnline = connected && status === 'online'
-
-  const [items, setItems] = useState<Workspace[] | null>(() => (isServerOnline ? null : []))
+  const [items, setItems] = useState<Workspace[] | null>(null)
   const [tab, setTab] = useState<WorkspaceMode>('code')
   const [dialog, setDialog] = useState<{ open: boolean; mode: WorkspaceMode | null }>({
     open: false,
@@ -31,6 +27,7 @@ export default function Hub() {
   const [menu, setMenu] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editName, setEditName] = useState('')
+  const health = useServer((s) => s.health)
   const settings = useSettings()
 
   const openDialog = (mode?: WorkspaceMode) => {
@@ -44,25 +41,14 @@ export default function Hub() {
   const load = () =>
     api
       .workspaces()
-      .then((ws) => {
-        setItems(ws)
-        if (!useServer.getState().connected) {
-          useServer.setState({ status: 'online', connected: true })
-        }
-      })
+      .then(setItems)
       .catch((e) => {
         setItems([])
-        if (useServer.getState().status === 'online') {
-          toast.error(formatApiError(e))
-        }
+        toast.error(formatApiError(e))
       })
 
   useEffect(() => {
     void load()
-  }, [isServerOnline])
-
-  useEffect(() => {
-    if (!isServerOnline) return
     let timer: ReturnType<typeof setInterval> | undefined
 
     const start = () => {
@@ -93,7 +79,7 @@ export default function Hub() {
         document.removeEventListener('visibilitychange', onVisChange)
       }
     }
-  }, [isServerOnline])
+  }, [])
 
   const remove = async (w: Workspace) => {
     if (!confirm(`Delete “${w.name}” and everything built from it? This cannot be undone.`)) return
@@ -118,7 +104,7 @@ export default function Hub() {
     setEditingId(null)
   }
 
-  const showCards = !isServerOnline || (items !== null && items.length === 0)
+  const first = items !== null && items.length === 0
 
   const codeItems = items?.filter((w) => (w.kind || 'code') === 'code') ?? []
   const docsItems = items?.filter((w) => w.kind === 'docs') ?? []
@@ -133,24 +119,10 @@ export default function Hub() {
           <Logo />
         </Link>
         <div className="flex items-center gap-3">
-          {isServerOnline ? (
-            <span className="chip">
-              <i className="pulse-dot !h-1.5 !w-1.5" /> Server connected
-            </span>
-          ) : (
-            <div className="flex items-center gap-2">
-              <span className="chip border-coral/30 text-mist">
-                <i className="pulse-dot off !h-1.5 !w-1.5" /> Server not connected
-              </span>
-              <button
-                type="button"
-                className="btn btn-ghost btn-sm !h-7 !px-2.5 text-xs text-ink"
-                onClick={() => openDialog('code')}
-              >
-                Connect
-              </button>
-            </div>
-          )}
+          <span className="chip">
+            <i className="pulse-dot !h-1.5 !w-1.5" /> Server {health?.version} ·{' '}
+            {health?.llm.available ? health.llm.provider : 'offline answers'}
+          </span>
           <div className="relative">
             <button className="icon-btn" aria-label="Display settings" onClick={() => setMenu(!menu)}>
               <Settings2 size={18} />
@@ -174,11 +146,11 @@ export default function Hub() {
       </header>
 
       <main className="relative z-10 mx-auto max-w-6xl px-5 pb-20">
-        {isServerOnline && items === null ? (
+        {items === null ? (
           <div className="grid h-64 place-items-center">
             <Spinner size={26} />
           </div>
-        ) : showCards ? (
+        ) : first ? (
           <div className="mx-auto max-w-2xl pt-8">
             <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} className="space-y-6">
               <div className="text-center">
@@ -263,11 +235,6 @@ export default function Hub() {
                   </div>
                 </Spot>
               </div>
-              {!isServerOnline && (
-                <p className="mt-6 text-center text-xs text-mist/70">
-                  Your workspaces appear here once the local server is running.
-                </p>
-              )}
             </motion.div>
           </div>
         ) : (

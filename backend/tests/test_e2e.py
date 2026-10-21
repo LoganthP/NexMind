@@ -528,3 +528,62 @@ def test_connect_script_no_third_party(client):
     assert r.status_code == 200
     for lib in ('requests', 'httpx', 'aiohttp', 'flask', 'fastapi', 'pydantic'):
         assert 'import ' + lib not in r.text
+
+
+def test_fs_pick_endpoint(client, monkeypatch):
+    import subprocess
+    import types
+
+    # 1. Successful pick returns normalised path
+    def mock_run_success(*args, **kwargs):
+        return types.SimpleNamespace(returncode=0, stdout="C:/Users/me/project/../project\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", mock_run_success)
+    r = client.post("/api/fs/pick", json={"title": "Pick", "initial": "C:/Users"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["cancelled"] is False
+    assert data["path"] == os.path.normpath("C:/Users/me/project")
+
+    # 2. Cancelled pick
+    def mock_run_cancel(*args, **kwargs):
+        return types.SimpleNamespace(returncode=0, stdout="\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", mock_run_cancel)
+    r = client.post("/api/fs/pick", json={})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["cancelled"] is True
+    assert data["path"] is None
+
+    # 3. Tkinter fails -> 501
+    def mock_run_fail(*args, **kwargs):
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="No display")
+
+    monkeypatch.setattr(subprocess, "run", mock_run_fail)
+    r = client.post("/api/fs/pick", json={})
+    assert r.status_code == 501
+    assert "not available on this computer" in r.text
+
+    # 4. Reject non-loopback clients
+    remote_client = TestClient(app, client=("192.168.1.100", 54321))
+    r = remote_client.post("/api/fs/pick", json={})
+    assert r.status_code == 403
+
+
+def test_fs_check_src_subfolder(client, tmp_path):
+    proj_dir = tmp_path / "my_project"
+    proj_dir.mkdir()
+    (proj_dir / "package.json").write_text('{"name": "demo"}')
+    src_dir = proj_dir / "src"
+    src_dir.mkdir()
+    (src_dir / "index.ts").write_text('console.log("hello");')
+    r = client.get(f"/api/fs/check?path={src_dir}")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+    assert data["exists"] is True
+    assert data["is_dir"] is True
+    assert data["supported_files"] > 0
+    assert data["has_code"] is True
+    assert "package.json" in data["markers"]

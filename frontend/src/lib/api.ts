@@ -246,6 +246,8 @@ export const api = {
   ingestLocal: (id: string, path: string) => request<{ job_id: string }>(`/api/workspaces/${id}/ingest/local`, { method: 'POST', body: j({ path }) }),
   fsList: (path?: string, files = 1) => request<FsListing>(`/api/fs/list${q({ path, files })}`),
   fsCheck: (path: string) => request<import('./types').FsCheckResult>(`/api/fs/check${q({ path })}`),
+  fsPick: (title?: string, initial?: string) =>
+    request<{ path: string | null; cancelled: boolean }>('/api/fs/pick', { method: 'POST', body: j({ title, initial }) }),
   connect: (path: string, name?: string, watch = true) =>
     request<{ workspace_id: string; job_id: string; name: string; url: string; reused: boolean }>('/api/connect', { method: 'POST', body: j({ path, name, watch }) }),
   connectSessions: (since = 0) =>

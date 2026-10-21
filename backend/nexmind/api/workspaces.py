@@ -39,6 +39,11 @@ class LocalIn(BaseModel):
     path: str
 
 
+class FsPickIn(BaseModel):
+    title: str | None = None
+    initial: str | None = None
+
+
 def ws_dir(ws_id: str) -> Path:
     return settings.workspaces_dir / ws_id
 
@@ -477,6 +482,72 @@ def fs_list(request: Request, path: str | None = None, files: int = 1) -> dict:
     }
 
 
+@router.post("/fs/pick", tags=["system"])
+def fs_pick(request: Request, body: FsPickIn | None = None) -> dict:
+    """Open the operating system's folder-selection dialog on this machine (loopback only)."""
+    require_local(request)
+    import os
+    import subprocess
+    import sys
+
+    initial = (body.initial.strip() if body and body.initial else "") or str(Path.home())
+    title = (body.title.strip() if body and body.title else "Select Folder")
+
+    script = """
+import sys, os
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes('-topmost', True)
+    except Exception:
+        pass
+    initial = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None
+    title = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
+    kwargs = {'mustexist': True}
+    if initial:
+        kwargs['initialdir'] = initial
+    if title:
+        kwargs['title'] = title
+    path = filedialog.askdirectory(**kwargs)
+    if path:
+        print(path)
+    root.destroy()
+except Exception as e:
+    sys.stderr.write(str(e))
+    sys.exit(2)
+"""
+
+    try:
+        res = subprocess.run(
+            [sys.executable, "-c", script, initial, title],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        return {"path": None, "cancelled": True}
+    except Exception as e:
+        raise HTTPException(
+            501,
+            "The folder window is not available on this computer. Use the folder browser instead.",
+        ) from e
+
+    if res.returncode != 0:
+        raise HTTPException(
+            501,
+            "The folder window is not available on this computer. Use the folder browser instead.",
+        )
+
+    out = res.stdout.strip()
+    if not out:
+        return {"path": None, "cancelled": True}
+
+    return {"path": os.path.normpath(out), "cancelled": False}
+
+
 @router.get("/fs/check", tags=["system"])
 def fs_check(request: Request, path: str | None = None) -> dict:
     require_local(request)
@@ -516,9 +587,18 @@ def fs_check(request: Request, path: str | None = None) -> dict:
                         elif item.name == "__init__.py":
                             markers.append("__init__.py")
         if not markers:
+            # Check parent for project markers when selecting a sub-folder like 'src'
+            try:
+                if p.parent and p.parent != p and p.parent != Path(p.parent.anchor):
+                    for item in p.parent.iterdir():
+                        if item.name in PROJECT_MARKERS or item.name.endswith(".sln"):
+                            markers.append(item.name)
+            except (OSError, PermissionError):
+                pass
+        if not markers:
             if any(p.glob("*.py")) or any(p.glob("*/*.py")):
                 markers.append("python")
-            if any(p.glob("*.js")) or any(p.glob("*/*.js")):
+            if any(p.glob("*.js")) or any(p.glob("*/*.js")) or any(p.glob("*.ts")) or any(p.glob("*/*.ts")) or any(p.glob("*.tsx")) or any(p.glob("*/*.tsx")):
                 markers.append("javascript")
     except PermissionError as e:
         return JSONResponse(status_code=400, content={"ok": False, "exists": True, "is_dir": True, "readable": False, "markers": [], "supported_files": 0, "has_code": False, "has_docs": False, "message": "Cannot open this folder (permission denied)", "detail": "Cannot open this folder (permission denied)"})

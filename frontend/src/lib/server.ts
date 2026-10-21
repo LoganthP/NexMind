@@ -2,10 +2,8 @@ import { create } from 'zustand'
 import { api, DEFAULT_API, getApiBase, setApiBase } from './api'
 import type { Health } from './types'
 
-export interface ServerState {
+interface ServerState {
   status: 'checking' | 'offline' | 'online'
-  connected: boolean
-  justConnected: number
   base: string
   health: Health | null
   attempts: number
@@ -29,80 +27,32 @@ function candidates(): string[] {
   return [...new Set(list)]
 }
 
-async function probeWithTimeout(base: string, timeoutMs: number): Promise<Health | null> {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  const timeoutPromise = new Promise<null>((resolve) => {
-    timer = setTimeout(() => resolve(null), timeoutMs)
-  })
-  try {
-    return await Promise.race([api.probe(base), timeoutPromise])
-  } finally {
-    clearTimeout(timer)
-  }
-}
-
 let inFlight: Promise<boolean> | null = null
-let isFirstProbe = true
 
 export const useServer = create<ServerState>((set, get) => ({
   status: 'checking',
-  connected: false,
-  justConnected: 0,
   base: getApiBase(),
   health: null,
   attempts: 0,
   check: async () => {
     if (inFlight) return inFlight
-    const isFirst = isFirstProbe
-    isFirstProbe = false
-
-    const runCheck = async (): Promise<boolean> => {
+    inFlight = (async () => {
       try {
-        const timeout = isFirst ? 1200 : 2500
         for (const base of candidates()) {
-          const h = await probeWithTimeout(base, timeout)
+          const h = await api.probe(base)
           if (h) {
             setApiBase(base)
-            const wasOnline = get().status === 'online' || get().connected
-            set({
-              status: 'online',
-              connected: true,
-              justConnected: wasOnline ? (get().justConnected || Date.now()) : Date.now(),
-              base,
-              health: h,
-              attempts: 0,
-            })
-            try {
-              sessionStorage.setItem('nexmind.serverSeen', '1')
-              localStorage.setItem('nexmind.serverSeen', '1')
-              localStorage.setItem('nexmind.serverEverDetected', '1')
-            } catch { /* ignore */ }
+            set({ status: 'online', base, health: h, attempts: 0 })
+            try { sessionStorage.setItem('nexmind.serverSeen', '1') } catch { /* ignore */ }
             return true
           }
         }
-        set({ status: 'offline', connected: false, health: null, attempts: get().attempts + 1 })
+        set({ status: 'offline', health: null, attempts: get().attempts + 1 })
         return false
       } finally {
         inFlight = null
       }
-    }
-
-    if (isFirst) {
-      let timer: ReturnType<typeof setTimeout> | undefined
-      const deadlinePromise = new Promise<boolean>((resolve) => {
-        timer = setTimeout(() => {
-          set({ status: 'offline', connected: false, health: null, attempts: get().attempts + 1 })
-          resolve(false)
-        }, 1200)
-      })
-      inFlight = Promise.race([runCheck(), deadlinePromise]).finally(() => {
-        clearTimeout(timer)
-        inFlight = null
-      })
-      return inFlight
-    }
-
-    inFlight = runCheck()
+    })()
     return inFlight
   },
   useBase: async (url) => {
@@ -111,35 +61,11 @@ export const useServer = create<ServerState>((set, get) => ({
     const h = await api.probe(clean)
     if (!h) return false
     setApiBase(clean)
-    const wasOnline = get().status === 'online' || get().connected
-    set({
-      status: 'online',
-      connected: true,
-      justConnected: wasOnline ? (get().justConnected || Date.now()) : Date.now(),
-      base: clean,
-      health: h,
-      attempts: 0,
-    })
-    try {
-      sessionStorage.setItem('nexmind.serverSeen', '1')
-      localStorage.setItem('nexmind.serverSeen', '1')
-      localStorage.setItem('nexmind.serverEverDetected', '1')
-    } catch { /* ignore */ }
+    set({ status: 'online', base: clean, health: h, attempts: 0 })
+    try { sessionStorage.setItem('nexmind.serverSeen', '1') } catch { /* ignore */ }
     return true
   },
 }))
-
-// Auto-sync connected flag whenever status changes (e.g. via direct useServer.setState in tests)
-useServer.subscribe((state) => {
-  if (state.status === 'online' && !state.connected) {
-    useServer.setState({
-      connected: true,
-      justConnected: state.justConnected || Date.now(),
-    })
-  } else if (state.status !== 'online' && state.connected) {
-    useServer.setState({ connected: false })
-  }
-})
 
 let timer: ReturnType<typeof setTimeout> | undefined
 let running = false

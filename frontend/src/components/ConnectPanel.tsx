@@ -1,11 +1,22 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { CheckCircle2, Folder, Terminal, AlertCircle } from 'lucide-react'
+import {
+  AlertCircle,
+  CheckCircle2,
+  ChevronDown,
+  ExternalLink,
+  Folder,
+  FolderOpen,
+  Loader2,
+  RotateCcw,
+  Terminal,
+} from 'lucide-react'
 import { api, formatApiError, ApiError } from '@/lib/api'
 import { useServer } from '@/lib/server'
-import { detectOS, getUniversalConnectCommands, type OS } from '@/lib/os'
+import { detectOS, type OS } from '@/lib/os'
 import { CopyBlock, Spinner, Switch } from './ui'
 import { FolderPicker } from './FolderPicker'
+import { ServerStatusBar } from './ServerStatusBar'
 
 interface Props {
   onSuccess?: (wsId: string) => void
@@ -14,22 +25,49 @@ interface Props {
 
 export function ConnectPanel({ onSuccess, onClose }: Props) {
   const nav = useNavigate()
-  const base = useServer((s) => s.base)
+  const { status, base, health } = useServer()
+  const isOnline = status === 'online'
+
   const [os, setOs] = useState<OS>(detectOS())
   const [connectedSession, setConnectedSession] = useState<{
     name: string
     workspace_id: string
     reused: boolean
   } | null>(null)
-  const [pickerOpen, setPickerOpen] = useState(false)
+
+  // Advanced / local clone collapsed section
+  const [showAdvanced, setShowAdvanced] = useState(false)
+
+  // Card C: Choose folder fallback
+  const [pickerModalOpen, setPickerModalOpen] = useState(false)
+  const [pickingNative, setPickingNative] = useState(false)
   const [keepSync, setKeepSync] = useState(true)
-  const [connecting, setConnecting] = useState(false)
+  const [connectingFolder, setConnectingFolder] = useState(false)
+  const [queuedFolder, setQueuedFolder] = useState<string | null>(null)
   const [errorMsg, setErrorMsg] = useState('')
+
+  // ServerStatusBar help expanded
+  const [helpExpanded, setHelpExpanded] = useState(false)
 
   const startTimestampRef = useRef<number>(0)
   const timerRef = useRef<any>(null)
+  const inFlightConnectRef = useRef(false)
 
-  // Initialize since timestamp and start polling sessions
+  const serverBase = (base || 'http://127.0.0.1:8000').replace(/\/+$/, '')
+
+  // Universal connect commands: never contain "&&"
+  const getCommand = (system: OS) => {
+    const scriptUrl = `${serverBase}/connect.py`
+    if (system === 'windows') {
+      return `irm ${scriptUrl} | python - .`
+    }
+    return `curl -fsSL ${scriptUrl} | python3 - .`
+  }
+
+  const universalCommand = getCommand(os)
+  const shellLabel = os === 'windows' ? 'PowerShell' : 'Terminal'
+
+  // Sessions polling when online
   useEffect(() => {
     let active = true
 
@@ -76,10 +114,16 @@ export function ConnectPanel({ onSuccess, onClose }: Props) {
       .then((res) => {
         if (!active) return
         startTimestampRef.current = res.now || Date.now() / 1000
+        if (useServer.getState().status !== 'online') {
+          useServer.setState({ status: 'online' })
+        }
         timerRef.current = setTimeout(poll, 1500)
       })
       .catch(() => {
         startTimestampRef.current = Date.now() / 1000
+        if (isOnline) {
+          timerRef.current = setTimeout(poll, 1500)
+        }
       })
 
     return () => {
@@ -89,69 +133,112 @@ export function ConnectPanel({ onSuccess, onClose }: Props) {
         document.removeEventListener('visibilitychange', onVisChange)
       }
     }
-  }, [nav, onSuccess])
+  }, [isOnline, nav, onSuccess])
 
-  // Use the live server base URL so the command works regardless of port.
-  // Fall back to the python executable path (old-style) when the backend is
-  // recent enough to serve /connect.py; otherwise show the classic command.
-  const serverBase = (base || 'http://127.0.0.1:8000').replace(/\/$/, '')
-  const { primary: primaryCommand, alt: altCommand } = getUniversalConnectCommands(os, serverBase)
-  const shellLabel = os === 'windows' ? 'PowerShell' : 'Terminal'
+  const executeConnectFolder = useCallback(
+    async (folderPath: string) => {
+      if (inFlightConnectRef.current) return
+      inFlightConnectRef.current = true
+      setConnectingFolder(true)
+      setErrorMsg('')
 
-  // Standard fallback command if user installed nexmind via pip
-  const legacyCommand = altCommand
+      try {
+        const res = await api.connect(folderPath, undefined, keepSync)
+        setQueuedFolder(null)
+        setConnectedSession({
+          name: res.name,
+          workspace_id: res.workspace_id,
+          reused: res.reused,
+        })
+        setTimeout(() => {
+          if (onSuccess) onSuccess(res.workspace_id)
+          else nav(`/app/w/${res.workspace_id}`)
+        }, 1200)
+      } catch (e: any) {
+        if (e instanceof ApiError) {
+          if (e.status === 404 || e.status === 405 || e.status === 422) {
+            setErrorMsg('Your backend is out of date. Restart it with python -m nexmind serve')
+          } else if (e.status === 403) {
+            setErrorMsg('Local folder access is refused by the server (check NEXMIND_ALLOW_LOCAL_PATHS).')
+          } else {
+            setErrorMsg(formatApiError(e))
+          }
+        } else {
+          setErrorMsg(formatApiError(e))
+        }
+        setQueuedFolder(null)
+      } finally {
+        setConnectingFolder(false)
+        inFlightConnectRef.current = false
+      }
+    },
+    [keepSync, nav, onSuccess]
+  )
 
-  const handlePickFolder = async (path: string) => {
-    setConnecting(true)
+  // Handle queued folder connection when server comes online
+  useEffect(() => {
+    if (queuedFolder && isOnline && !inFlightConnectRef.current) {
+      void executeConnectFolder(queuedFolder)
+    }
+  }, [queuedFolder, isOnline, executeConnectFolder])
+
+  const handlePickFolder = (chosenPath: string) => {
+    if (!isOnline) {
+      setQueuedFolder(chosenPath)
+      setHelpExpanded(true)
+      return
+    }
+    void executeConnectFolder(chosenPath)
+  }
+
+  const handleNativeBrowse = async () => {
+    setPickingNative(true)
     setErrorMsg('')
     try {
-      const res = await api.connect(path, undefined, keepSync)
-      setConnectedSession({
-        name: res.name,
-        workspace_id: res.workspace_id,
-        reused: res.reused,
-      })
-      setTimeout(() => {
-        if (onSuccess) onSuccess(res.workspace_id)
-        else nav(`/app/w/${res.workspace_id}`)
-      }, 1200)
-    } catch (e: any) {
-      if (e instanceof ApiError && (e.status === 404 || e.status === 422)) {
-        setErrorMsg('Your backend is out of date. Restart it with: python -m nexmind serve')
-      } else {
-        setErrorMsg(formatApiError(e))
+      const res = await api.fsPick('Select a project folder for Live Connect')
+      if (res.cancelled) return
+      if (res.path) {
+        handlePickFolder(res.path)
       }
+    } catch {
+      // Fall back to in-app FolderPicker
+      setPickerModalOpen(true)
     } finally {
-      setConnecting(false)
+      setPickingNative(false)
     }
   }
 
   if (connectedSession) {
     return (
       <div className="flex flex-col items-center justify-center gap-3 py-10 text-center">
-        <CheckCircle2 size={40} className="text-plankton animate-bounce" />
+        <CheckCircle2 size={40} className="text-coral animate-bounce" />
         <h3 className="text-xl font-bold text-ink">
           {connectedSession.reused
             ? `Re-indexing ${connectedSession.name}`
             : `Connected ${connectedSession.name} · live sync on`}
         </h3>
-        <p className="text-xs text-mist">Opening workspace…</p>
+        <p className="text-xs text-mist">Opening live workspace…</p>
       </div>
     )
   }
 
   return (
-    <div className="space-y-6">
-      {/* Step 1: Terminal commands */}
-      <div className="space-y-3">
+    <div className="space-y-4">
+      {/* Server Status Bar */}
+      <ServerStatusBar
+        expanded={helpExpanded}
+        onToggleExpand={setHelpExpanded}
+        pending={!!queuedFolder}
+        onCancelPending={() => setQueuedFolder(null)}
+      />
+
+      {/* Card A: Terminal Command */}
+      <div className="rounded-2xl border hair bg-black/20 p-4 space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-2.5">
           <div className="flex items-center gap-2 min-w-0">
-            <Terminal size={16} className="text-plankton shrink-0" />
+            <Terminal size={16} className="text-coral shrink-0" />
             <h3 className="text-sm font-semibold text-ink">
-              Open your project in VS Code and run in terminal{' '}
-              <span className="font-mono text-xs font-normal text-mist">
-                ({os === 'mac' ? 'Cmd + `' : 'Ctrl + `'})
-              </span>
+              Open your project in VS Code, open its terminal ({os === 'mac' ? 'Cmd + `' : 'Ctrl + `'}) and run
             </h3>
           </div>
 
@@ -159,6 +246,7 @@ export function ConnectPanel({ onSuccess, onClose }: Props) {
             {(['windows', 'mac', 'linux'] as const).map((key) => (
               <button
                 key={key}
+                type="button"
                 role="tab"
                 aria-selected={os === key}
                 className={`tab !h-7 !px-2.5 !text-xs ${os === key ? 'on' : ''}`}
@@ -170,50 +258,128 @@ export function ConnectPanel({ onSuccess, onClose }: Props) {
           </div>
         </div>
 
-        {/* Universal one-liner (no nexmind install required) */}
-        <CopyBlock label={`${shellLabel} · no install needed`} command={primaryCommand} />
+        {/* Dimmed block indicator when offline */}
+        {!isOnline && (
+          <div className="flex items-center justify-between rounded-lg bg-amber/10 border border-amber/20 px-3 py-1.5 text-xs text-amber font-medium">
+            <span>Start the server first (see below)</span>
+            <span className="text-[0.7rem] text-amber/80 font-normal">Command is still copyable</span>
+          </div>
+        )}
 
-        {/* Fallback: installed via pip */}
-        <div className="space-y-1.5">
-          <p className="text-xs text-mist">Or, if you installed nexmind via pip:</p>
-          <CopyBlock label={`${shellLabel} · pip`} command={legacyCommand} />
+        <div className={!isOnline ? 'opacity-65 transition-opacity' : 'transition-opacity'}>
+          <CopyBlock
+            label={`${shellLabel} · no install needed`}
+            command={universalCommand}
+          />
         </div>
 
-        <p className="text-xs text-mist leading-relaxed">
-          Run it from your project&apos;s root folder. Use <code className="mono text-ink">--no-watch</code> to index once without continuous sync.
-        </p>
+        {/* Fallback / short form */}
+        <div className="space-y-1.5">
+          <p className="text-xs text-mist">Or with nexmind installed:</p>
+          <CopyBlock label={`${shellLabel} · short form`} command="nexmind connect ." />
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-mist pt-0.5">
+          <span>Run it from your project&apos;s root folder.</span>
+          <a
+            href={`${serverBase}/connect.py`}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1 text-coral hover:underline"
+          >
+            <span>View the script</span>
+            <ExternalLink size={12} />
+          </a>
+        </div>
+
+        {/* Collapsible: Already have the backend folder? */}
+        <div className="border-t hair pt-2.5">
+          <button
+            type="button"
+            className="flex items-center justify-between w-full text-left text-xs text-mist hover:text-ink transition-colors py-1"
+            onClick={() => setShowAdvanced(!showAdvanced)}
+            aria-expanded={showAdvanced}
+          >
+            <span className="font-medium">Already have the backend folder?</span>
+            <ChevronDown
+              size={14}
+              className={`transition-transform duration-200 ${showAdvanced ? 'rotate-180' : ''}`}
+            />
+          </button>
+
+          {showAdvanced && (
+            <div className="mt-2 space-y-2 text-xs text-mist pt-1">
+              {health?.python_executable && (
+                <CopyBlock
+                  label="Local Python"
+                  command={`${health.python_executable} -m nexmind connect .`}
+                />
+              )}
+              <CopyBlock
+                label="Short form"
+                command="nexmind connect ."
+              />
+              <p className="text-[0.7rem] text-mist/80">
+                Options: <code className="mono text-ink">--no-watch</code> (one-time index),{' '}
+                <code className="mono text-ink">--name &quot;My project&quot;</code> (override workspace name).
+              </p>
+            </div>
+          )}
+        </div>
       </div>
 
-      {/* Step 2: Waiting indicator */}
-      <div className="flex items-center gap-3 rounded-xl border border-plankton/30 bg-plankton/5 p-4">
-        <div className="relative grid h-4 w-4 place-items-center">
-          <span className="absolute h-full w-full animate-ping rounded-full bg-plankton/40" />
-          <span className="h-2 w-2 rounded-full bg-plankton" />
+      {/* Card B: Waiting for your project */}
+      <div className="rounded-xl border border-coral/30 bg-coral/5 p-4 space-y-2">
+        <div className="flex items-center justify-between">
+          <h4 className="text-sm font-semibold text-ink">Waiting for your project</h4>
+          <span className="flex items-center gap-1.5 text-xs text-coral">
+            <span className="h-2 w-2 rounded-full bg-coral animate-ping" />
+            <span>Live sync</span>
+          </span>
         </div>
-        <div className="flex-1">
-          <p className="text-sm font-medium text-ink">Waiting for your project…</p>
-          <p className="text-xs text-mist">
-            Once you run the command, NexMind connects automatically and opens the live graph.
-          </p>
+        <div className="flex items-center gap-3">
+          <div className="relative grid h-4 w-4 place-items-center shrink-0">
+            <span className="absolute h-full w-full animate-ping rounded-full bg-coral/40" />
+            <span className="h-2 w-2 rounded-full bg-coral" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <p className="text-xs font-medium text-ink">
+              {isOnline ? 'Listening for incoming connections…' : 'Waiting for the server…'}
+            </p>
+            <p className="text-xs text-mist truncate">
+              {isOnline
+                ? 'Once you run the command in your terminal, the live graph builds and opens automatically.'
+                : 'Connect the server above to start listening for incoming connections.'}
+            </p>
+          </div>
+          <Spinner size={16} />
         </div>
-        <Spinner size={16} />
       </div>
 
       {/* Inline error if any */}
       {errorMsg && (
-        <div className="flex items-center gap-2 rounded-xl border border-coral/40 bg-coral/10 p-3 text-xs text-coral">
-          <AlertCircle size={16} className="shrink-0" />
-          <span className="flex-1">{errorMsg}</span>
+        <div className="flex items-start gap-2.5 rounded-xl border border-coral/40 bg-coral/10 p-3 text-xs text-coral">
+          <AlertCircle size={15} className="shrink-0 mt-0.5" />
+          <div className="flex-1 leading-relaxed">{errorMsg}</div>
+          {queuedFolder && (
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm !h-6 !px-2 text-coral hover:!bg-coral/20 shrink-0 flex items-center gap-1"
+              onClick={() => handlePickFolder(queuedFolder)}
+            >
+              <RotateCcw size={12} /> Retry
+            </button>
+          )}
         </div>
       )}
 
-      {/* Fallback: No terminal? */}
-      <div className="border-t border-line/60 pt-4 space-y-3">
+      {/* Card C: No terminal? Pick the folder here */}
+      <div className="rounded-2xl border hair bg-black/20 p-4 space-y-3">
         <h4 className="text-xs font-semibold text-mist uppercase tracking-wider">
           No terminal? Pick the folder here
         </h4>
 
-        <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 rounded-xl border border-line bg-black/20 p-3">
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 rounded-xl border hair bg-black/30 p-3">
           <div className="flex-1">
             <Switch
               label="Keep in sync (live)"
@@ -222,25 +388,52 @@ export function ConnectPanel({ onSuccess, onClose }: Props) {
             />
           </div>
 
-          <button
-            type="button"
-            className="btn btn-ghost btn-sm !h-8 shrink-0 flex items-center gap-2"
-            disabled={connecting}
-            onClick={() => setPickerOpen(true)}
-          >
-            {connecting ? <Spinner size={14} /> : <Folder size={14} className="text-plankton" />}
-            <span>Choose folder…</span>
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm !h-8.5 px-3 flex items-center gap-1.5 text-xs font-medium"
+              disabled={connectingFolder || pickingNative}
+              onClick={handleNativeBrowse}
+            >
+              {pickingNative || connectingFolder ? (
+                <Loader2 size={14} className="animate-spin text-coral" />
+              ) : (
+                <Folder size={14} className="text-coral" />
+              )}
+              <span>
+                {connectingFolder
+                  ? 'Connecting…'
+                  : pickingNative
+                    ? 'Opening…'
+                    : 'Choose folder…'}
+              </span>
+            </button>
+          </div>
         </div>
+
+        {queuedFolder && !isOnline && (
+          <div className="flex items-center justify-between text-xs text-amber px-1">
+            <span>
+              Folder selected ({queuedFolder.replace(/[\\/]+$/, '').split(/[\\/]/).pop()}) — Waiting for server…
+            </span>
+            <button
+              type="button"
+              className="underline hover:text-ink transition-colors ml-2"
+              onClick={() => setQueuedFolder(null)}
+            >
+              Cancel
+            </button>
+          </div>
+        )}
       </div>
 
-      {pickerOpen && (
+      {pickerModalOpen && (
         <FolderPicker
-          onPick={(path) => {
-            setPickerOpen(false)
-            void handlePickFolder(path)
+          onPick={(chosen) => {
+            setPickerModalOpen(false)
+            handlePickFolder(chosen)
           }}
-          onClose={() => setPickerOpen(false)}
+          onClose={() => setPickerModalOpen(false)}
         />
       )}
     </div>

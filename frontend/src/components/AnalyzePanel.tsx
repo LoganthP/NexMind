@@ -132,6 +132,19 @@ export function AnalyzePanel({ workspaceId, onStarted, compact, kind = 'code', r
     }
   }
 
+  const handleBrowse = async () => {
+    try {
+      const res = await api.fsPick('Select a folder', path || undefined)
+      if (res.cancelled) return
+      if (res.path) {
+        setPath(res.path)
+        setError(null)
+      }
+    } catch {
+      setPicker(true)
+    }
+  }
+
   const fileAccept = kind === 'docs'
     ? '.pdf,.docx,.md,.txt,.html,.zip,.tar.gz'
     : '.zip,.tar.gz,.tgz,.tar,.py,.js,.ts,.tsx,.jsx,.go,.rs,.java,.c,.cpp,.h,.rb,.php,.json,.yaml,.yml'
@@ -224,7 +237,7 @@ export function AnalyzePanel({ workspaceId, onStarted, compact, kind = 'code', r
                   spellCheck={false}
                   onKeyDown={(e) => e.key === 'Enter' && submit()}
                 />
-                <button className="btn btn-ghost shrink-0" type="button" onClick={() => setPicker(true)}>
+                <button className="btn btn-ghost shrink-0" type="button" onClick={handleBrowse}>
                   <FolderOpen size={16} /> Browse
                 </button>
               </div>

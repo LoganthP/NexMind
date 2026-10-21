@@ -2,10 +2,9 @@ import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ArrowLeft, BookOpen, Code2, Terminal, X } from 'lucide-react'
 import { Modal } from './Modal'
-import { AnalyzePanel } from './AnalyzePanel'
+import { DocumentsForm } from './ModeForms/DocumentsForm'
+import { ProjectsForm } from './ModeForms/ProjectsForm'
 import { ConnectPanel } from './ConnectPanel'
-import ServerConnectSteps from './ServerConnectSteps'
-import { useServer } from '@/lib/server'
 
 export type WorkspaceMode = 'code' | 'docs' | 'live'
 
@@ -56,14 +55,7 @@ const MODES: ModeCard[] = [
 
 export function NewWorkspaceDialog({ initialMode = null, onClose }: Props) {
   const nav = useNavigate()
-  const serverConnected = useServer((s) => s.connected || s.status === 'online')
-  const justConnected = useServer((s) => s.justConnected)
-
-  const [openedFromCard, setOpenedFromCard] = useState<boolean>(() => Boolean(initialMode))
-  const [step, setStep] = useState<'choose' | 'connect' | 'form'>(() => {
-    if (!initialMode) return 'choose'
-    return serverConnected ? 'form' : 'connect'
-  })
+  const [step, setStep] = useState<1 | 2>(() => (initialMode ? 2 : 1))
   const [mode, setMode] = useState<WorkspaceMode>(() => initialMode || 'code')
   const [focusedIndex, setFocusedIndex] = useState(() => {
     if (!initialMode) return 0
@@ -76,46 +68,29 @@ export function NewWorkspaceDialog({ initialMode = null, onClose }: Props) {
 
   const chooseMode = (m: WorkspaceMode) => {
     setMode(m)
-    if (serverConnected) {
-      setStep('form')
-    } else {
-      setStep('connect')
-    }
+    setStep(2)
   }
 
   // Derive state from initialMode prop on open / prop change
   useEffect(() => {
     if (initialMode) {
-      setOpenedFromCard(true)
+      setStep(2)
       setMode(initialMode)
-      const isConn = useServer.getState().connected || useServer.getState().status === 'online'
-      setStep(isConn ? 'form' : 'connect')
     } else {
-      setOpenedFromCard(false)
-      setStep('choose')
+      setStep(1)
     }
   }, [initialMode])
 
-  // Pre-focus active card on mount for choose step
+  // Pre-focus active card on mount for step 1
   useEffect(() => {
-    if (step === 'choose') {
+    if (step === 1) {
       cardRefs.current[focusedIndex]?.focus()
     }
   }, [step, focusedIndex])
 
-  // Auto-advance from connect step once server is detected
+  // Autofocus the first input of that mode on step 2
   useEffect(() => {
-    if (step === 'connect' && serverConnected) {
-      const timer = setTimeout(() => {
-        setStep('form')
-      }, 800)
-      return () => clearTimeout(timer)
-    }
-  }, [step, serverConnected, justConnected])
-
-  // Autofocus the first input of that mode on form step
-  useEffect(() => {
-    if (step === 'form') {
+    if (step === 2) {
       const timer = setTimeout(() => {
         if (!containerRef.current) return
         if (mode === 'code') {
@@ -141,9 +116,9 @@ export function NewWorkspaceDialog({ initialMode = null, onClose }: Props) {
     }
   }, [step, mode])
 
-  // Keyboard navigation for choose step: 1/2/3, Arrow keys, Enter
+  // Keyboard navigation for step 1: 1/2/3, Arrow keys, Enter
   const handleKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-    if (step !== 'choose') return
+    if (step !== 1) return
 
     if (e.key === '1') {
       e.preventDefault()
@@ -174,41 +149,29 @@ export function NewWorkspaceDialog({ initialMode = null, onClose }: Props) {
     }
   }
 
-  const handleBack = () => {
-    if (step === 'connect') {
-      if (openedFromCard) {
-        onClose()
-      } else {
-        setStep('choose')
-      }
-    } else if (step === 'form') {
-      setStep('choose')
-    }
-  }
-
   const currentMeta = MODES.find((m) => m.id === mode)!
 
   return (
     <Modal
       onClose={onClose}
-      closeOnBackdrop={step === 'choose'}
+      closeOnBackdrop={step === 1}
       header={
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2.5">
-            {step !== 'choose' && (
+            {step === 2 && (
               <button
                 type="button"
                 className="btn btn-ghost btn-sm !h-7 !px-2 text-xs flex items-center gap-1 text-mist hover:text-ink"
-                onClick={handleBack}
-                aria-label={step === 'connect' && openedFromCard ? 'Back' : 'Back to choices'}
+                onClick={() => setStep(1)}
+                aria-label="Back to choices"
               >
                 <ArrowLeft size={14} /> Back
               </button>
             )}
             <h2 className="text-base font-semibold tracking-tight text-ink">
-              {step === 'choose' ? 'What do you want to explore?' : `New ${currentMeta.title}`}
+              {step === 1 ? 'What do you want to explore?' : `New ${currentMeta.title}`}
             </h2>
-            {step !== 'choose' && (
+            {step === 2 && (
               <span className={`chip text-xs ${currentMeta.chipCls}`}>
                 {currentMeta.title}
               </span>
@@ -225,8 +188,8 @@ export function NewWorkspaceDialog({ initialMode = null, onClose }: Props) {
         </div>
       }
     >
-      <div ref={containerRef} onKeyDown={handleKeyDown} className="max-h-[75vh] overflow-y-auto pr-1">
-        {step === 'choose' ? (
+      <div ref={containerRef} onKeyDown={handleKeyDown}>
+        {step === 1 ? (
           <div className="py-2 space-y-4">
             <p className="text-sm text-mist">
               Choose the kind of workspace to create. You can explore source code, read documents, or connect live from your editor.
@@ -275,27 +238,10 @@ export function NewWorkspaceDialog({ initialMode = null, onClose }: Props) {
               })}
             </div>
           </div>
-        ) : step === 'connect' ? (
-          <div className="py-2">
-            <div className="mb-4">
-              <div className="text-sm font-semibold text-ink">
-                Step 1 of 2: connect the NexMind server on this computer
-              </div>
-              <p className="mt-1 text-xs text-mist">
-                {mode === 'code'
-                  ? 'Projects are analyzed on your computer, so your code stays with you.'
-                  : mode === 'docs'
-                    ? 'Documents are processed on your computer, so your files stay with you.'
-                    : 'NexMind connects directly to your editor on your computer, so your work stays with you.'}
-              </p>
-            </div>
-            <ServerConnectSteps connected={serverConnected} />
-          </div>
         ) : (
           <div className="py-2">
             {mode === 'code' && (
-              <AnalyzePanel
-                kind="code"
+              <ProjectsForm
                 onStarted={(_jobId, wsId) => {
                   onClose()
                   nav(`/app/w/${wsId}`)
@@ -303,8 +249,7 @@ export function NewWorkspaceDialog({ initialMode = null, onClose }: Props) {
               />
             )}
             {mode === 'docs' && (
-              <AnalyzePanel
-                kind="docs"
+              <DocumentsForm
                 onStarted={(_jobId, wsId) => {
                   onClose()
                   nav(`/app/w/${wsId}`)

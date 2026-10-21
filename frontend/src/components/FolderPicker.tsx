@@ -325,8 +325,9 @@ export function FolderPicker({ onPick, onClose, initialPath }: Props) {
   }
 
   return (
-    <Modal
-      open={true}
+    <div className="relative z-[60]">
+      <Modal
+        open={true}
       onClose={onClose}
       maxWidth="min(680px, calc(100vw - 2rem))"
       title="Choose a project folder"
@@ -499,5 +500,6 @@ export function FolderPicker({ onPick, onClose, initialPath }: Props) {
         </div>
       </div>
     </Modal>
+    </div>
   )
 }
