@@ -6,6 +6,7 @@ import { FolderPicker } from '@/components/FolderPicker'
 import Hub from '@/pages/Hub'
 import { toast, useToasts } from '@/lib/store'
 import { api, formatApiError } from '@/lib/api'
+import { useServer } from '@/lib/server'
 import type { Workspace } from '@/lib/types'
 
 // Mock api methods
@@ -31,6 +32,13 @@ describe('NewWorkspaceDialog and Live Connect experience', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     useToasts.setState({ items: [] })
+    useServer.setState({
+      status: 'online',
+      connected: true,
+      justConnected: Date.now(),
+      base: 'http://127.0.0.1:8000',
+      health: { app: 'nexmind', status: 'ok', version: '1.1.0', llm: { provider: 'mock', model: null, available: true } },
+    })
   })
 
   it('a) Clicking "New workspace" shows step 1 with exactly three cards and no URL/token/folder fields', () => {
@@ -257,6 +265,13 @@ describe('Mode selection and step skipping UX in Hub and NewWorkspaceDialog', ()
   beforeEach(() => {
     vi.clearAllMocks()
     vi.mocked(api.connectSessions).mockResolvedValue({ now: 1000, sessions: [] })
+    useServer.setState({
+      status: 'online',
+      connected: true,
+      justConnected: Date.now(),
+      base: 'http://127.0.0.1:8000',
+      health: { app: 'nexmind', status: 'ok', version: '1.1.0', llm: { provider: 'mock', model: null, available: true } },
+    })
   })
 
   it('(a) first-run screen: clicking each card opens the dialog on step 2 for the right mode, and the text "What do you want to explore?" is NOT shown', async () => {

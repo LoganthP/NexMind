@@ -1,4 +1,4 @@
-import { render, screen, cleanup, waitFor, act } from '@testing-library/react'
+import { render, screen, cleanup, waitFor, act, fireEvent, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -12,6 +12,8 @@ vi.mock('@/three/engine', () => {
 })
 
 import App from '@/App'
+import '@/pages/AppShell'
+import '@/pages/Hub'
 import { useServer } from '@/lib/server'
 import { useView } from '@/lib/store'
 
@@ -29,66 +31,77 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
-describe('startup-flow bug fixes', () => {
-  it('a) healthy server renders dashboard immediately without ConnectGate or 1s delay', async () => {
-    localStorage.setItem('nexmind.api', 'http://127.0.0.1:8000')
-    useServer.setState({ status: 'checking', health: null, attempts: 0, base: 'http://127.0.0.1:8000' })
+describe('startup-flow bug fixes and mode-first server-second flow', () => {
+  it('a) Server unreachable: rendering /app shows the three mode cards within 500 ms; "Start your local server" is NOT on screen; header shows "Server not connected"', async () => {
+    localStorage.setItem('nexmind.api', 'http://127.0.0.1:59999')
+    useServer.setState({ status: 'checking', connected: false, health: null, attempts: 0, base: 'http://127.0.0.1:59999' })
 
-    globalThis.fetch = vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
-      const url = String(input)
-      if (url.includes('/api/health')) {
-        return new Response(JSON.stringify({
-          app: 'nexmind',
-          status: 'ok',
-          version: '1.1.0',
-          llm: { provider: 'mock', model: null, available: true }
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
-      }
-      if (url.includes('/api/workspaces')) {
-        return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } })
-      }
-      return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
-    })
-
-    let sawStartCommands = false
-    const observer = new MutationObserver(() => {
-      if (document.body.textContent?.includes('Start your local server')) {
-        sawStartCommands = true
-      }
-    })
-    observer.observe(document.body, { childList: true, subtree: true, characterData: true })
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('Unreachable server'))
 
     const start = Date.now()
-    render(<MemoryRouter initialEntries={['/app']}><App /></MemoryRouter>)
+    render(
+      <MemoryRouter initialEntries={['/app']}>
+        <App />
+      </MemoryRouter>
+    )
 
-    const heading = await screen.findByRole('heading', { name: /Create your first workspace|^Workspaces$/i })
+    // Shows the three mode cards within 500 ms
+    const heading = await screen.findByRole('heading', { name: /Create your first workspace/i }, { timeout: 500 })
     const elapsed = Date.now() - start
     expect(heading).toBeTruthy()
-    // Old behaviour waited 1100 ms before releasing; new behaviour releases immediately
-    expect(elapsed).toBeLessThan(2500)
+    expect(elapsed).toBeLessThan(1000)
 
-    // Poll every 50 ms for 2 s to assert "Start your local server" is NEVER in the document
-    const deadline = Date.now() + 2000
-    while (Date.now() < deadline) {
-      if (document.body.textContent?.includes('Start your local server')) {
-        sawStartCommands = true
-      }
-      await new Promise((r) => setTimeout(r, 50))
-    }
-    observer.disconnect()
+    expect(screen.getByText('Analyze a project')).toBeTruthy()
+    expect(screen.getByText('Study from documents')).toBeTruthy()
+    expect(screen.getByText('Live connect')).toBeTruthy()
 
-    expect(sawStartCommands).toBe(false)
+    // The text "Start your local server" is NOT on the screen
+    expect(screen.queryByRole('heading', { name: /Start your local server/i })).toBeNull()
+    expect(document.body.textContent).not.toContain('Start your local server')
+
+    // The header shows "Server not connected"
+    expect(screen.getByText(/Server not connected/i)).toBeTruthy()
   })
 
-  it('b) unreachable server shows commands gate only after ~1.5s, shows Connected when server answers, and releases', async () => {
+  it('b) Clicking "Analyze a project" with the server offline opens dialog on Connect step with Projects chip, numbered steps, no "connect.py", and no "&&"', async () => {
     localStorage.setItem('nexmind.api', 'http://127.0.0.1:59999')
-    useServer.setState({ status: 'checking', health: null, attempts: 0, base: 'http://127.0.0.1:59999' })
+    useServer.setState({ status: 'offline', connected: false, health: null, attempts: 1, base: 'http://127.0.0.1:59999' })
 
-    let serverOnline = false
-    globalThis.fetch = vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('Unreachable server'))
+
+    render(
+      <MemoryRouter initialEntries={['/app']}>
+        <App />
+      </MemoryRouter>
+    )
+
+    await screen.findByText('Analyze a project')
+    fireEvent.click(screen.getByText('Analyze a project'))
+
+    // Dialog opens on Connect step
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(/Step 1 of 2: connect the NexMind server on this computer/i)).toBeTruthy()
+
+    // With the Projects chip
+    const chips = within(dialog).getAllByText('Projects')
+    expect(chips.length).toBeGreaterThan(0)
+
+    // Shows the numbered steps
+    expect(within(dialog).getByText(/Get NexMind/i)).toBeTruthy()
+    expect(within(dialog).getByText(/Start the server/i)).toBeTruthy()
+    expect(within(dialog).getByText(/This page continues by itself/i)).toBeTruthy()
+
+    // No "connect.py" text
+    expect(dialog.textContent).not.toContain('connect.py')
+
+    // No copied command contains "&&"
+    expect(dialog.textContent).not.toContain('&&')
+  })
+
+  it('c) When mocked server becomes reachable, dialog shows "Connected" and advances to form without another click (Projects, Documents, Live connect)', async () => {
+    const mockHealthyFetch = vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url.includes('/api/health')) {
-        if (!serverOnline) throw new Error('Unreachable')
         return new Response(JSON.stringify({
           app: 'nexmind',
           status: 'ok',
@@ -102,30 +115,246 @@ describe('startup-flow bug fixes', () => {
       return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
 
-    const start = Date.now()
-    render(<MemoryRouter initialEntries={['/app']}><App /></MemoryRouter>)
+    // 1. Projects ('code')
+    {
+      globalThis.fetch = vi.fn().mockRejectedValue(new Error('Unreachable server'))
+      useServer.setState({ status: 'offline', connected: false, health: null, attempts: 1, base: 'http://127.0.0.1:8000' })
+      const { unmount } = render(
+        <MemoryRouter initialEntries={['/app']}>
+          <App />
+        </MemoryRouter>
+      )
 
-    // At 1.1s, the gate should not be visible yet
-    await new Promise((r) => setTimeout(r, 1100))
-    expect(screen.queryByRole('heading', { name: /Start your local server/i })).toBeNull()
+      await screen.findByText('Analyze a project')
+      fireEvent.click(screen.getByText('Analyze a project'))
+      expect(await screen.findByText(/Step 1 of 2: connect the NexMind server/i)).toBeTruthy()
 
-    // Gate appears after ~1.5s
-    const gate = await screen.findByRole('heading', { name: /Start your local server/i }, { timeout: 4000 })
-    const delay = Date.now() - start
-    expect(gate).toBeTruthy()
-    expect(delay).toBeGreaterThanOrEqual(1300)
+      // Mocked server becomes reachable
+      globalThis.fetch = mockHealthyFetch
+      await act(async () => {
+        await useServer.getState().check()
+      })
 
-    // Now bring server online
-    serverOnline = true
-    await act(async () => {
-      await useServer.getState().check()
+      // Shows "Connected"
+      expect(await screen.findByText(/Connected to NexMind/i)).toBeTruthy()
+
+      // Automatically advances to Projects form without another click
+      expect(await screen.findByRole('tab', { name: 'GitHub' }, { timeout: 3000 })).toBeTruthy()
+      unmount()
+    }
+
+    // 2. Documents ('docs')
+    {
+      globalThis.fetch = vi.fn().mockRejectedValue(new Error('Unreachable server'))
+      useServer.setState({ status: 'offline', connected: false, health: null, attempts: 1, base: 'http://127.0.0.1:8000' })
+      const { unmount } = render(
+        <MemoryRouter initialEntries={['/app']}>
+          <App />
+        </MemoryRouter>
+      )
+
+      await screen.findByText('Study from documents')
+      fireEvent.click(screen.getByText('Study from documents'))
+      expect(await screen.findByText(/Step 1 of 2: connect the NexMind server/i)).toBeTruthy()
+
+      globalThis.fetch = mockHealthyFetch
+      await act(async () => {
+        await useServer.getState().check()
+      })
+
+      expect(await screen.findByText(/Connected to NexMind/i)).toBeTruthy()
+      expect(await screen.findByText(/Drop PDFs, Word files/i, {}, { timeout: 3000 })).toBeTruthy()
+      unmount()
+    }
+
+    // 3. Live connect ('live')
+    {
+      globalThis.fetch = vi.fn().mockRejectedValue(new Error('Unreachable server'))
+      useServer.setState({ status: 'offline', connected: false, health: null, attempts: 1, base: 'http://127.0.0.1:8000' })
+      const { unmount } = render(
+        <MemoryRouter initialEntries={['/app']}>
+          <App />
+        </MemoryRouter>
+      )
+
+      await screen.findByText('Live connect')
+      fireEvent.click(screen.getByText('Live connect'))
+      expect(await screen.findByText(/Step 1 of 2: connect the NexMind server/i)).toBeTruthy()
+
+      globalThis.fetch = mockHealthyFetch
+      await act(async () => {
+        await useServer.getState().check()
+      })
+
+      expect(await screen.findByText(/Connected to NexMind/i)).toBeTruthy()
+      expect(await screen.findByText(/Waiting for your project/i, {}, { timeout: 3000 })).toBeTruthy()
+      unmount()
+    }
+  })
+
+  it('d) Server reachable from the start: clicking a card goes straight to mode form; "+ New workspace" shows mode chooser first', async () => {
+    useServer.setState({
+      status: 'online',
+      connected: true,
+      justConnected: Date.now(),
+      base: 'http://127.0.0.1:8000',
+      health: { app: 'nexmind', status: 'ok', version: '1.1.0', llm: { provider: 'mock', model: null, available: true } },
     })
 
-    // Gate displays Connected confirmation
-    expect(await screen.findByText(/Connected to NexMind/i, {}, { timeout: 4000 })).toBeTruthy()
+    // 0 workspaces -> first-run 3-card screen
+    globalThis.fetch = vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/workspaces')) {
+        return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
 
-    // Releases to dashboard
-    expect(await screen.findByRole('heading', { name: /Create your first workspace|^Workspaces$/i }, { timeout: 4000 })).toBeTruthy()
+    const { unmount } = render(
+      <MemoryRouter initialEntries={['/app']}>
+        <App />
+      </MemoryRouter>
+    )
+
+    await screen.findByText('Analyze a project')
+    fireEvent.click(screen.getByText('Analyze a project'))
+
+    // Goes straight to Projects form (no connect step)
+    expect(screen.queryByText(/Step 1 of 2: connect the NexMind server/i)).toBeNull()
+    expect(screen.getByRole('tab', { name: 'GitHub' })).toBeTruthy()
+    expect(screen.getByRole('tab', { name: 'Local folder' })).toBeTruthy()
+    unmount()
+
+    // Render with an existing workspace
+    const sampleWorkspace = {
+      id: 'ws-sample-1',
+      name: 'Existing Project',
+      description: '',
+      kind: 'code',
+      status: 'ready',
+      created_at: 100,
+      updated_at: 100,
+      source_count: 1,
+      thread_count: 0,
+      stats: { nodes: 10, edges: 12, files: 5 },
+    }
+
+    globalThis.fetch = vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/workspaces')) {
+        return new Response(JSON.stringify([sampleWorkspace]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(
+      <MemoryRouter initialEntries={['/app']}>
+        <App />
+      </MemoryRouter>
+    )
+
+    expect(await screen.findByText('Existing Project')).toBeTruthy()
+
+    // Click "+ New workspace"
+    fireEvent.click(screen.getByRole('button', { name: /^New workspace$/i }))
+
+    // Shows mode chooser first
+    expect(screen.getByText('What do you want to explore?')).toBeTruthy()
+    expect(screen.getByText('Projects')).toBeTruthy()
+    expect(screen.getByText('Documents')).toBeTruthy()
+    expect(screen.getByText('Live connect')).toBeTruthy()
+  })
+
+  it('e) Deep link /app/w/abc with server unreachable shows full-page gate with a "Back to modes" link to /app', async () => {
+    localStorage.setItem('nexmind.api', 'http://127.0.0.1:59999')
+    useServer.setState({ status: 'offline', connected: false, health: null, attempts: 1, base: 'http://127.0.0.1:59999' })
+
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('Unreachable server'))
+
+    render(
+      <MemoryRouter initialEntries={['/app/w/abc']}>
+        <App />
+      </MemoryRouter>
+    )
+
+    // Shows full-page gate
+    expect(await screen.findByRole('heading', { name: /Start your local server/i })).toBeTruthy()
+
+    // Has "Back to modes" link that points to /app
+    const backLink = screen.getByRole('link', { name: /Back to modes/i })
+    expect(backLink).toBeTruthy()
+    expect(backLink.getAttribute('href')).toBe('/app')
+
+    // Clicking "Back to modes" returns to /app
+    fireEvent.click(backLink)
+    expect(await screen.findByRole('heading', { name: /Create your first workspace/i })).toBeTruthy()
+  })
+
+  it('f) A previously connected session that loses the server keeps the current page and shows reconnecting banner', async () => {
+    sessionStorage.setItem('nexmind.serverSeen', '1')
+    useServer.setState({
+      status: 'online',
+      connected: true,
+      justConnected: Date.now(),
+      base: 'http://127.0.0.1:8000',
+      health: { app: 'nexmind', status: 'ok', version: '1.1.0', llm: { provider: 'mock', model: null, available: true } },
+    })
+
+    globalThis.fetch = vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/workspaces/ws-live/threads')) {
+        return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url.includes('/api/workspaces/ws-live/graph')) {
+        return new Response(JSON.stringify({
+          nodes: [{ id: 'n1', type: 'File', label: 'index.ts', x: 0, y: 0, z: 0, cluster: 1, score: 1 }],
+          links: [],
+          clusters: [],
+          truncated: false,
+          total_nodes: 1,
+          total_edges: 0,
+          status: 'ready',
+          legend: { node_colors: {}, edge_colors: {} },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url.includes('/api/workspaces/ws-live')) {
+        return new Response(JSON.stringify({
+          id: 'ws-live',
+          name: 'Connected Workspace',
+          description: '',
+          status: 'ready',
+          source_count: 1,
+          thread_count: 0,
+          kind: 'code',
+          created_at: Date.now(),
+          updated_at: Date.now(),
+          stats: { nodes: 1 },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    render(
+      <MemoryRouter initialEntries={['/app/w/ws-live']}>
+        <App />
+      </MemoryRouter>
+    )
+
+    // Current workspace page renders
+    expect(await screen.findByText(/Connected Workspace/i)).toBeTruthy()
+
+    // Server goes offline
+    await act(async () => {
+      useServer.setState({ status: 'offline', connected: false })
+    })
+
+    // Stays on current page: does NOT swap to ConnectGate ("Start your local server")
+    expect(screen.queryByRole('heading', { name: /Start your local server/i })).toBeNull()
+    expect(screen.getByText(/Connected Workspace/i)).toBeTruthy()
+
+    // Shows reconnecting banner
+    expect(screen.getByRole('alert')).toBeTruthy()
+    expect(screen.getByText(/Lost connection to the NexMind server — reconnecting…/i)).toBeTruthy()
   })
 
   it('c) ready workspace with stats.nodes 654 shows Loading 654 nodes, never flashes empty state or Repository URL, then becomes ready', async () => {

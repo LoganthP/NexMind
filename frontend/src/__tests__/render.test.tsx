@@ -18,7 +18,7 @@ describe('pages that need no server', () => {
 
   it('shows the "Start your local server" screen when nothing is running, with copyable commands', async () => {
     localStorage.setItem('nexmind.api', 'http://127.0.0.1:59999') // nothing listens here
-    render(<MemoryRouter initialEntries={['/app']}><App /></MemoryRouter>)
+    render(<MemoryRouter initialEntries={['/app/w/unreachable']}><App /></MemoryRouter>)
     expect(await screen.findByRole('heading', { name: /Start your local server/i })).toBeTruthy()
     expect(await screen.findByText(/Listening for server/i)).toBeTruthy()
     fireEvent.click(screen.getByRole('tab', { name: 'Windows' }))
