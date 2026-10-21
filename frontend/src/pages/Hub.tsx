@@ -4,6 +4,7 @@ import { motion } from 'framer-motion'
 import { BookOpen, Code2, FileText, FolderGit2, Plus, Settings2, Terminal, Trash2 } from 'lucide-react'
 import { Aurora, Logo, Spinner, Spot, Switch } from '@/components/ui'
 import { NewWorkspaceDialog, type WorkspaceMode } from '@/components/NewWorkspaceDialog'
+import { ServerConnectSteps } from '@/components/ServerConnectSteps'
 import { ApiError, api, formatApiError } from '@/lib/api'
 import { toast, useSettings } from '@/lib/store'
 import { useServer } from '@/lib/server'
@@ -25,9 +26,13 @@ export default function Hub() {
     mode: null,
   })
   const [menu, setMenu] = useState(false)
+  const [connectOpen, setConnectOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editName, setEditName] = useState('')
+  const serverStatus = useServer((s) => s.status)
   const health = useServer((s) => s.health)
+  const isOnline = serverStatus === 'online'
+  const isOffline = serverStatus === 'offline'
   const settings = useSettings()
 
   const openDialog = (mode?: WorkspaceMode) => {
@@ -44,8 +49,16 @@ export default function Hub() {
       .then(setItems)
       .catch((e) => {
         setItems([])
-        toast.error(formatApiError(e))
+        if (useServer.getState().status === 'online') {
+          toast.error(formatApiError(e))
+        }
       })
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      ;(window as any).__NEXMIND_BUILD__ = typeof __BUILD__ !== 'undefined' ? __BUILD__ : 'dev'
+    }
+  }, [])
 
   useEffect(() => {
     void load()
@@ -104,7 +117,7 @@ export default function Hub() {
     setEditingId(null)
   }
 
-  const first = items !== null && items.length === 0
+  const first = isOffline || (items !== null && items.length === 0)
 
   const codeItems = items?.filter((w) => (w.kind || 'code') === 'code') ?? []
   const docsItems = items?.filter((w) => w.kind === 'docs') ?? []
@@ -119,10 +132,40 @@ export default function Hub() {
           <Logo />
         </Link>
         <div className="flex items-center gap-3">
-          <span className="chip">
-            <i className="pulse-dot !h-1.5 !w-1.5" /> Server {health?.version} ·{' '}
-            {health?.llm.available ? health.llm.provider : 'offline answers'}
-          </span>
+          {isOnline ? (
+            <span className="chip">
+              <i className="pulse-dot !h-1.5 !w-1.5" /> Server {health?.version} ·{' '}
+              {health?.llm.available ? health.llm.provider : 'offline answers'}
+            </span>
+          ) : (
+            <div className="relative">
+              <span className="chip border-coral/40 text-mist">
+                <i className="pulse-dot off !h-1.5 !w-1.5" /> Server not connected
+                <button
+                  type="button"
+                  className="ml-2 font-medium text-plankton hover:underline focus:outline-none"
+                  onClick={() => setConnectOpen(!connectOpen)}
+                >
+                  Connect
+                </button>
+              </span>
+              {connectOpen && (
+                <div className="glass absolute right-0 top-11 z-50 w-96 rounded-2xl p-4 shadow-2xl">
+                  <div className="mb-2 flex items-center justify-between">
+                    <span className="font-semibold text-ink text-sm">Server connection</span>
+                    <button
+                      type="button"
+                      className="text-xs text-mist hover:text-ink"
+                      onClick={() => setConnectOpen(false)}
+                    >
+                      Close
+                    </button>
+                  </div>
+                  <ServerConnectSteps compact />
+                </div>
+              )}
+            </div>
+          )}
           <div className="relative">
             <button className="icon-btn" aria-label="Display settings" onClick={() => setMenu(!menu)}>
               <Settings2 size={18} />
@@ -146,7 +189,7 @@ export default function Hub() {
       </header>
 
       <main className="relative z-10 mx-auto max-w-6xl px-5 pb-20">
-        {items === null ? (
+        {items === null && !isOffline ? (
           <div className="grid h-64 place-items-center">
             <Spinner size={26} />
           </div>
@@ -158,6 +201,11 @@ export default function Hub() {
                 <p className="mx-auto mt-2 max-w-[48ch] text-sm text-mist">
                   Choose what you want to analyze. NexMind builds the knowledge graph right on your machine.
                 </p>
+                {isOffline && (
+                  <p className="mt-2 text-xs text-mist/70">
+                    Your saved workspaces appear here once the local server is running.
+                  </p>
+                )}
               </div>
               <div className="grid gap-4 sm:grid-cols-3">
                 <Spot className="cursor-pointer transition-all hover:scale-[1.02]">
@@ -397,6 +445,10 @@ export default function Hub() {
           onClose={closeDialog}
         />
       )}
+
+      <footer className="relative z-10 pb-6 text-center text-xs text-mist/40 font-mono">
+        build {typeof __BUILD__ !== 'undefined' ? __BUILD__ : 'dev'}
+      </footer>
     </div>
   )
 }

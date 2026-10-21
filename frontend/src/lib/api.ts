@@ -222,9 +222,9 @@ const q = (o: Record<string, string | number | boolean | undefined | null>) => {
 
 export const api = {
   /** Used by the connect screen: short timeout, explicit base, validates that it is really NexMind. */
-  async probe(base: string): Promise<Health | null> {
+  async probe(base: string, timeoutMs = 2500): Promise<Health | null> {
     try {
-      const h = await request<Health>('/api/health', {}, base.replace(/\/+$/, ''), 2500)
+      const h = await request<Health>('/api/health', {}, base.replace(/\/+$/, ''), timeoutMs)
       return h && h.app === 'nexmind' ? h : null
     } catch { return null }
   },

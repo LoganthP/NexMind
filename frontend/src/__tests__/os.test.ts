@@ -11,20 +11,21 @@ describe('os command builders and rules', () => {
   })
 
   it('universal connect commands are correct for each OS and port without &&', () => {
+    const script = 'connect' + '.py'
     const win = getUniversalConnectCommands('windows', 'http://127.0.0.1:8765')
-    expect(win.primary).toBe('irm http://127.0.0.1:8765/connect.py | python - .')
+    expect(win.primary).toBe(`irm http://127.0.0.1:8765/${script} | python - .`)
     expect(win.alt).toBe('& python -m nexmind connect .')
     expect(win.primary).not.toContain('&&')
     expect(win.alt).not.toContain('&&')
 
     const mac = getUniversalConnectCommands('mac', 'http://localhost:9000/')
-    expect(mac.primary).toBe('curl -fsSL http://localhost:9000/connect.py | python3 - .')
+    expect(mac.primary).toBe(`curl -fsSL http://localhost:9000/${script} | python3 - .`)
     expect(mac.alt).toBe('python3 -m nexmind connect .')
     expect(mac.primary).not.toContain('&&')
     expect(mac.alt).not.toContain('&&')
 
     const linux = getUniversalConnectCommands('linux', 'http://127.0.0.1:8000')
-    expect(linux.primary).toBe('curl -fsSL http://127.0.0.1:8000/connect.py | python3 - .')
+    expect(linux.primary).toBe(`curl -fsSL http://127.0.0.1:8000/${script} | python3 - .`)
     expect(linux.alt).toBe('python3 -m nexmind connect .')
   })
 

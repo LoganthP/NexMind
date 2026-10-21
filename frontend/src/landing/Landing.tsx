@@ -187,7 +187,7 @@ function ConnectDemo({ cmd }: { cmd: string }) {
       <div className="border-t hair px-4 py-4">
         <div className="flex items-center gap-3 rounded-xl bg-black/35 px-4 py-3">
           <span className={`pulse-dot ${step < 2 ? 'off' : ''}`} />
-          <div className="text-sm"><div className={`font-medium ${step >= 2 ? 'text-plankton' : ''}`}>{step < 2 ? 'Listening for server…' : 'Connected to NexMind 1.1.0'}</div><div className="text-xs text-mist">{step < 2 ? 'Checking 127.0.0.1:8000' : step >= 4 ? 'Graph growing: 412 / 640 nodes' : 'Choose what to analyze'}</div></div>
+          <div className="text-sm"><div className={`font-medium ${step >= 2 ? 'text-plankton' : ''}`}>{step < 2 ? 'Waiting for local server…' : 'Connected to NexMind 1.1.0'}</div><div className="text-xs text-mist">{step < 2 ? 'Checking 127.0.0.1:8000' : step >= 4 ? 'Graph growing: 412 / 640 nodes' : 'Choose what to analyze'}</div></div>
         </div>
         {step >= 3 && <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-gradient-to-r from-plankton to-jelly transition-all duration-[2200ms]" style={{ width: step >= 4 ? '64%' : '8%' }} /></div>}
       </div>

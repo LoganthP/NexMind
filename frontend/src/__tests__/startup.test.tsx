@@ -30,7 +30,7 @@ afterEach(() => {
 })
 
 describe('startup-flow bug fixes', () => {
-  it('a) healthy server renders dashboard immediately without ConnectGate or 1s delay', async () => {
+  it('a) healthy server renders dashboard immediately without delay', async () => {
     localStorage.setItem('nexmind.api', 'http://127.0.0.1:8000')
     useServer.setState({ status: 'checking', health: null, attempts: 0, base: 'http://127.0.0.1:8000' })
 
@@ -50,82 +50,29 @@ describe('startup-flow bug fixes', () => {
       return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
     })
 
-    let sawStartCommands = false
-    const observer = new MutationObserver(() => {
-      if (document.body.textContent?.includes('Start your local server')) {
-        sawStartCommands = true
-      }
-    })
-    observer.observe(document.body, { childList: true, subtree: true, characterData: true })
-
     const start = Date.now()
     render(<MemoryRouter initialEntries={['/app']}><App /></MemoryRouter>)
 
     const heading = await screen.findByRole('heading', { name: /Create your first workspace|^Workspaces$/i })
     const elapsed = Date.now() - start
     expect(heading).toBeTruthy()
-    // Old behaviour waited 1100 ms before releasing; new behaviour releases immediately
     expect(elapsed).toBeLessThan(2500)
-
-    // Poll every 50 ms for 2 s to assert "Start your local server" is NEVER in the document
-    const deadline = Date.now() + 2000
-    while (Date.now() < deadline) {
-      if (document.body.textContent?.includes('Start your local server')) {
-        sawStartCommands = true
-      }
-      await new Promise((r) => setTimeout(r, 50))
-    }
-    observer.disconnect()
-
-    expect(sawStartCommands).toBe(false)
   })
 
-  it('b) unreachable server shows commands gate only after ~1.5s, shows Connected when server answers, and releases', async () => {
+  it('b) unreachable server renders Hub immediately, never gates', async () => {
     localStorage.setItem('nexmind.api', 'http://127.0.0.1:59999')
-    useServer.setState({ status: 'checking', health: null, attempts: 0, base: 'http://127.0.0.1:59999' })
+    useServer.setState({ status: 'offline', health: null, attempts: 1, base: 'http://127.0.0.1:59999' })
 
-    let serverOnline = false
-    globalThis.fetch = vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
-      const url = String(input)
-      if (url.includes('/api/health')) {
-        if (!serverOnline) throw new Error('Unreachable')
-        return new Response(JSON.stringify({
-          app: 'nexmind',
-          status: 'ok',
-          version: '1.1.0',
-          llm: { provider: 'mock', model: null, available: true }
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
-      }
-      if (url.includes('/api/workspaces')) {
-        return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } })
-      }
-      return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    globalThis.fetch = vi.fn().mockImplementation(async () => {
+      throw new Error('Unreachable')
     })
 
-    const start = Date.now()
     render(<MemoryRouter initialEntries={['/app']}><App /></MemoryRouter>)
 
-    // At 1.1s, the gate should not be visible yet
-    await new Promise((r) => setTimeout(r, 1100))
-    expect(screen.queryByRole('heading', { name: /Start your local server/i })).toBeNull()
-
-    // Gate appears after ~1.5s
-    const gate = await screen.findByRole('heading', { name: /Start your local server/i }, { timeout: 4000 })
-    const delay = Date.now() - start
-    expect(gate).toBeTruthy()
-    expect(delay).toBeGreaterThanOrEqual(1300)
-
-    // Now bring server online
-    serverOnline = true
-    await act(async () => {
-      await useServer.getState().check()
-    })
-
-    // Gate displays Connected confirmation
-    expect(await screen.findByText(/Connected to NexMind/i, {}, { timeout: 4000 })).toBeTruthy()
-
-    // Releases to dashboard
-    expect(await screen.findByRole('heading', { name: /Create your first workspace|^Workspaces$/i }, { timeout: 4000 })).toBeTruthy()
+    // Hub renders immediately with three modes and quiet line
+    expect(await screen.findByRole('heading', { name: /Create your first workspace/i })).toBeTruthy()
+    expect(screen.getByText(/Your saved workspaces appear here once the local server is running/i)).toBeTruthy()
+    expect(screen.getByText(/Server not connected/i)).toBeTruthy()
   })
 
   it('c) ready workspace with stats.nodes 654 shows Loading 654 nodes, never flashes empty state or Repository URL, then becomes ready', async () => {

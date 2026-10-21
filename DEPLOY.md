@@ -33,7 +33,7 @@ Configure these under **Project Settings → Environment Variables** if overridi
 | Variable | Description | Default / Example |
 |---|---|---|
 | `VITE_API_URL` | Base URL of the NexMind FastAPI backend | `http://127.0.0.1:8000` (defaults to local backend) |
-| `VITE_BACKEND_REPO_URL` | Link to Python backend source repository | Optional fallback link in Connect Gate |
+| `VITE_BACKEND_REPO_URL` | Link to Python backend source repository | `https://github.com/LoganthP/NexMind` |
 | `VITE_BACKEND_ZIP_URL` | Direct archive download of backend bundle | Optional packaged download URL |
 | `VITE_PIP_PACKAGE` | Custom package name if distributed via PyPI | `nexmind` |
 
@@ -47,65 +47,45 @@ Before deploying new changes to production, run the local verification workflow.
 
 ```bash
 cd frontend
-npm run verify
+npm run typecheck
+npm test
+npm run build
 ```
 
-The `verify` script (`scripts/verify.mjs`) executes:
-1. `npm run typecheck` — TypeScript verification with no emit errors.
-2. `npm test` — Unit and component test suites via Vitest.
-3. `npm run build` — Production Vite build checking imports and case sensitivity.
-
-To test the production build locally with deep link navigation:
-```bash
-cd frontend
-npx vite preview
-```
-Visit `http://localhost:4173/app` and `http://localhost:4173/app/w/<id>` to verify routing, backend detection, and legend colors.
+The build automatically triggers `postbuild` (`npm run check:forbidden`), which runs `scripts/check-forbidden.mjs` to ensure forbidden screens or legacy server wizard text never return.
 
 ---
 
-## 4. Deployment & Redeploy Steps
+## 4. Deployment Verification Checklist
 
-### Method A: Git Push (Automatic CI/CD)
-1. Commit your changes:
-   ```bash
-   git add .
-   git commit -m "feat/fix: descriptive summary"
-   ```
-2. Push to the production branch:
-   ```bash
-   git push origin main
-   ```
-3. Vercel automatically detects the push, runs `npm ci`, and builds `frontend`.
+Follow these steps for every deployment to production:
 
-### Method B: Manual CLI Deployment
-If deploying directly from the command line:
-1. Navigate to the frontend directory:
-   ```bash
-   cd frontend
-   ```
-2. Run production deployment:
-   ```bash
-   npx vercel --prod
-   ```
+1. **Commit and Push to Production Branch:**
+   - Commit and push your changes to your repository's production branch (`main` or `master`).
+   - In **Vercel → Deployments**, confirm that the latest deployment is **"Ready"** and built from the latest commit (the build log displays the commit hash `VERCEL_GIT_COMMIT_SHA`).
+   - If the deployment was triggered as a preview deployment, click **Promote to Production**.
 
----
+2. **Verify the Build Stamp on the Production Domain:**
+   - Open the **PRODUCTION domain** (e.g. `https://nexmind.vercel.app`, NOT an old per-deployment URL like `nexmind-xxxx.vercel.app`) in a **private/incognito window**.
+   - Navigate to `/app`.
+   - The Hub footer must display the tiny muted text matching the deployed commit hash: `build <commit-hash-7-chars>`.
+   - In the browser console, `window.__NEXMIND_BUILD__` will match this same commit hash.
+   - If it displays an older hash, the previous build is still being served: in Vercel, go to the deployment and click **Redeploy with "Redeploy without cache"**.
 
-## 5. Checking Build Logs & Health
+3. **Verify Cache Control & Service Workers:**
+   - In `vercel.json`, `index.html` is configured with `Cache-Control: no-cache` so browsers always fetch the newest release.
+   - Confirm that no service worker is registered (NexMind does not register service workers). In DevTools → Application → Service Workers, verify there are no active service workers.
 
-1. Go to your Vercel Project Dashboard: `https://vercel.com/<team>/<project>`.
-2. Click on the **Deployments** tab.
-3. Select the latest deployment to view:
-   - **Building**: Logs of `npm ci` and `vite build`. Confirm chunks (`vendor-react`, `vendor-three`, `vendor-force-graph`, etc.) were emitted without warnings.
-   - **Checks**: Verify header rules and rewrites from `vercel.json` applied cleanly.
-4. Open the production URL in Chrome DevTools to verify:
-   - No duplicate `OPTIONS` preflight requests for API calls.
-   - Initial load completes in < 400 ms.
-   - WebSocket connection (`ws://127.0.0.1:8000/ws/...`) connects and streams data.
+4. **Verify Offline Experience on Production Domain:**
+   - When opened without a local server running, `/app` immediately displays the three workspace modes (Projects, Documents, Live connect) along with the quiet line:
+     `Your saved workspaces appear here once the local server is running.`
+   - The header displays `Server not connected` with a `Connect` button opening inline server connection guidance.
+   - Direct workspace URLs (`/app/w/:id`) display a small inline card titled `"Can't reach your NexMind server"` with "Try again now", "Open NexMind on this computer", and "Back to modes".
+   - No full-page server wizard or blocking gate ever replaces the application.
 
 ---
 
-## 6. Rollback Procedure
+## 5. Rollback Procedure
 
 If an issue occurs in production:
 1. Navigate to **Deployments** in your Vercel Dashboard.

@@ -2,13 +2,44 @@ import { create } from 'zustand'
 import { api, DEFAULT_API, getApiBase, setApiBase } from './api'
 import type { Health } from './types'
 
-interface ServerState {
+export interface ServerState {
   status: 'checking' | 'offline' | 'online'
+  connected: boolean
   base: string
   health: Health | null
   attempts: number
-  check: () => Promise<boolean>
+  check: (timeoutMs?: number) => Promise<boolean>
   useBase: (url: string) => Promise<boolean>
+}
+
+type JustConnectedListener = (detail: { base: string; health: Health }) => void
+const justConnectedListeners = new Set<JustConnectedListener>()
+
+/**
+ * Register a listener for when the server transitions from disconnected to connected.
+ */
+export function onJustConnected(cb: JustConnectedListener): () => void {
+  justConnectedListeners.add(cb)
+  return () => {
+    justConnectedListeners.delete(cb)
+  }
+}
+
+function notifyJustConnected(detail: { base: string; health: Health }): void {
+  justConnectedListeners.forEach((cb) => {
+    try {
+      cb(detail)
+    } catch {
+      /* ignore listener error */
+    }
+  })
+  if (typeof window !== 'undefined') {
+    try {
+      window.dispatchEvent(new CustomEvent('nexmind:justConnected', { detail }))
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 function candidates(): string[] {
@@ -28,26 +59,36 @@ function candidates(): string[] {
 }
 
 let inFlight: Promise<boolean> | null = null
+let isFirstProbe = true
 
 export const useServer = create<ServerState>((set, get) => ({
   status: 'checking',
+  connected: false,
   base: getApiBase(),
   health: null,
   attempts: 0,
-  check: async () => {
+  check: async (timeoutMs?: number) => {
     if (inFlight) return inFlight
+    const probeTimeout = timeoutMs ?? (isFirstProbe ? 1200 : 2500)
+    isFirstProbe = false
+
     inFlight = (async () => {
       try {
+        const wasOnline = get().status === 'online'
         for (const base of candidates()) {
-          const h = await api.probe(base)
+          const h = await api.probe(base, probeTimeout)
           if (h) {
             setApiBase(base)
-            set({ status: 'online', base, health: h, attempts: 0 })
+            set({ status: 'online', connected: true, base, health: h, attempts: 0 })
             try { sessionStorage.setItem('nexmind.serverSeen', '1') } catch { /* ignore */ }
+            try { localStorage.setItem('nexmind.serverSeen', '1') } catch { /* ignore */ }
+            if (!wasOnline) {
+              notifyJustConnected({ base, health: h })
+            }
             return true
           }
         }
-        set({ status: 'offline', health: null, attempts: get().attempts + 1 })
+        set({ status: 'offline', connected: false, health: null, attempts: get().attempts + 1 })
         return false
       } finally {
         inFlight = null
@@ -55,21 +96,27 @@ export const useServer = create<ServerState>((set, get) => ({
     })()
     return inFlight
   },
-  useBase: async (url) => {
+  useBase: async (url: string) => {
     const clean = url.trim().replace(/\/+$/, '')
     if (!/^https?:\/\//.test(clean)) return false
-    const h = await api.probe(clean)
+    const wasOnline = get().status === 'online'
+    const h = await api.probe(clean, 2500)
     if (!h) return false
     setApiBase(clean)
-    set({ status: 'online', base: clean, health: h, attempts: 0 })
+    set({ status: 'online', connected: true, base: clean, health: h, attempts: 0 })
     try { sessionStorage.setItem('nexmind.serverSeen', '1') } catch { /* ignore */ }
+    try { localStorage.setItem('nexmind.serverSeen', '1') } catch { /* ignore */ }
+    if (!wasOnline) {
+      notifyJustConnected({ base: clean, health: h })
+    }
     return true
   },
 }))
 
 let timer: ReturnType<typeof setTimeout> | undefined
 let running = false
-/** Poll for the local server: fast while it is missing (like "Listening for server…"), slow once connected. */
+
+/** Poll for the local server in the background: 1.5s when offline, 15s when connected. */
 export function startServerWatch(): () => void {
   running = true
 
@@ -101,7 +148,6 @@ export function startServerWatch(): () => void {
     document.addEventListener('visibilitychange', onVisChange)
   }
 
-  // Remove the duplicate first probe: startServerWatch should not fire its own immediate check if one is already in flight.
   if (inFlight) {
     inFlight.then((ok) => {
       if (!running) return
