@@ -587,3 +587,62 @@ def test_fs_check_src_subfolder(client, tmp_path):
     assert data["supported_files"] > 0
     assert data["has_code"] is True
     assert "package.json" in data["markers"]
+
+
+def test_ping_endpoint_and_preflight(client, monkeypatch):
+    from nexmind.config import settings
+
+    # 1. Ping OPTIONS preflight returns 204 with PNA and CORS headers
+    r_options = client.options(
+        "/api/ping",
+        headers={
+            "Origin": "https://random-site.com",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Private-Network": "true",
+        },
+    )
+    assert r_options.status_code == 204
+    assert r_options.headers.get("access-control-allow-origin") == "*"
+    assert r_options.headers.get("access-control-allow-private-network") == "true"
+    assert "GET" in r_options.headers.get("access-control-allow-methods", "")
+
+    # 2. Ping GET from allowed origin
+    monkeypatch.setattr(settings, "cors_origins", ["https://allowed.vercel.app"])
+    monkeypatch.setattr(settings, "cors_origin_regex", None)
+    r_allowed = client.get("/api/ping", headers={"Origin": "https://allowed.vercel.app"})
+    assert r_allowed.status_code == 200
+    data_allowed = r_allowed.json()
+    assert data_allowed["app"] == "nexmind"
+    assert data_allowed["ok"] is True
+    assert data_allowed["origin_allowed"] is True
+    assert data_allowed["origin"] == "https://allowed.vercel.app"
+    assert r_allowed.headers.get("access-control-allow-origin") == "*"
+    assert r_allowed.headers.get("access-control-allow-private-network") == "true"
+
+    # 3. Ping GET from disallowed origin
+    r_disallowed = client.get("/api/ping", headers={"Origin": "https://evil.example.com"})
+    assert r_disallowed.status_code == 200
+    data_disallowed = r_disallowed.json()
+    assert data_disallowed["app"] == "nexmind"
+    assert data_disallowed["ok"] is True
+    assert data_disallowed["origin_allowed"] is False
+    assert data_disallowed["origin"] == "https://evil.example.com"
+    # Still carries Access-Control-Allow-Origin: * and PNA
+    assert r_disallowed.headers.get("access-control-allow-origin") == "*"
+    assert r_disallowed.headers.get("access-control-allow-private-network") == "true"
+
+    # 4. Regex origin matching
+    monkeypatch.setattr(settings, "cors_origin_regex", r"^https://.*\.vercel\.app$")
+    r_regex = client.get("/api/ping", headers={"Origin": "https://my-preview-123.vercel.app"})
+    assert r_regex.json()["origin_allowed"] is True
+
+    # 5. Direct request without Origin header
+    r_no_origin = client.get("/api/ping")
+    assert r_no_origin.status_code == 200
+    assert r_no_origin.json()["origin_allowed"] is True
+    assert r_no_origin.json()["origin"] is None
+
+    # 6. /api/health behavior is unchanged
+    r_health = client.get("/api/health")
+    assert r_health.status_code == 200
+    assert r_health.json()["status"] == "ok"

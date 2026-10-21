@@ -1,19 +1,39 @@
 import { useState, useEffect } from 'react'
-import { ExternalLink, Terminal, AlertCircle, ChevronDown, Check, RefreshCw } from 'lucide-react'
+import { ExternalLink, Terminal, AlertCircle, ChevronDown, RefreshCw } from 'lucide-react'
 import { detectOS, type OS } from '@/lib/os'
 import { useServer } from '@/lib/server'
 import { CopyBlock } from './ui'
+
+export type BrowserType = 'chrome' | 'brave' | 'safari' | 'other'
+
+export function detectBrowser(): BrowserType {
+  if (typeof window === 'undefined' || typeof navigator === 'undefined') return 'chrome'
+  const ua = navigator.userAgent || ''
+  if ((navigator as any).brave || ua.includes('Brave')) return 'brave'
+  if (ua.includes('Safari') && !ua.includes('Chrome') && !ua.includes('Chromium') && !ua.includes('Edg')) return 'safari'
+  if (ua.includes('Chrome') || ua.includes('Edg')) return 'chrome'
+  return 'chrome'
+}
 
 interface ServerConnectStepsProps {
   compact?: boolean
 }
 
 export function ServerConnectSteps({ compact = true }: ServerConnectStepsProps) {
-  const { status, base, attempts, health, check, useBase } = useServer()
+  const { status, state, base, attempts, health, check, useBase } = useServer()
   const [os, setOs] = useState<OS>('windows')
   const [showDiag, setShowDiag] = useState(false)
   const [customUrl, setCustomUrl] = useState('')
   const [checkingCustom, setCheckingCustom] = useState(false)
+  const [checkResult, setCheckResult] = useState<string | null>(null)
+  const [isCheckingInline, setIsCheckingInline] = useState(false)
+
+  const [detectedBrowser, setDetectedBrowser] = useState<BrowserType>('chrome')
+  const [expandedBrowsers, setExpandedBrowsers] = useState<Record<string, boolean>>({
+    chrome: false,
+    brave: false,
+    safari: false,
+  })
 
   // Keep localStorage serverSeen only to auto-collapse the "Get NexMind" step
   const [showGetRepo, setShowGetRepo] = useState(() => {
@@ -26,6 +46,13 @@ export function ServerConnectSteps({ compact = true }: ServerConnectStepsProps) 
 
   useEffect(() => {
     setOs(detectOS())
+    const b = detectBrowser()
+    setDetectedBrowser(b)
+    setExpandedBrowsers({
+      chrome: b === 'chrome',
+      brave: b === 'brave',
+      safari: b === 'safari',
+    })
   }, [])
 
   const repoUrl =
@@ -39,13 +66,13 @@ export function ServerConnectSteps({ compact = true }: ServerConnectStepsProps) 
       : './start.sh'
 
   const shortCmd = 'nexmind serve'
-  const isOnline = status === 'online'
+  const isOnline = status === 'online' || state === 'connected'
   const serverAddress = base || 'http://127.0.0.1:8000'
 
   const handleCustomConnect = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!customUrl.trim()) {
-      void check()
+      void handleCheckAgain()
       return
     }
     setCheckingCustom(true)
@@ -54,6 +81,31 @@ export function ServerConnectSteps({ compact = true }: ServerConnectStepsProps) 
     } finally {
       setCheckingCustom(false)
     }
+  }
+
+  const handleCheckAgain = async () => {
+    setIsCheckingInline(true)
+    setCheckResult(null)
+    try {
+      const ok = await check(true)
+      if (ok) {
+        setCheckResult('Connected')
+      } else {
+        const s = useServer.getState().state
+        let reason = 'Server not running'
+        if (s === 'blocked-browser') reason = 'Browser is blocking local network'
+        else if (s === 'blocked-origin') reason = 'Origin not allowed'
+        else if (s === 'outdated') reason = 'Server is out of date'
+        else if (s === 'other-app') reason = 'Port in use by another app'
+        setCheckResult(`Still blocked: ${reason}`)
+      }
+    } finally {
+      setIsCheckingInline(false)
+    }
+  }
+
+  const toggleBrowser = (b: string) => {
+    setExpandedBrowsers((prev) => ({ ...prev, [b]: !prev[b] }))
   }
 
   return (
@@ -126,7 +178,120 @@ export function ServerConnectSteps({ compact = true }: ServerConnectStepsProps) 
         </div>
       </div>
 
-      {/* 3. Listening indicator */}
+      {/* 3. Direct Test Link */}
+      <div className="rounded-lg bg-black/20 p-2.5 border hair space-y-1">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5 font-semibold text-ink">
+            <span>Test the server directly:</span>
+            <a
+              href={`${serverAddress}/api/health`}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1 text-plankton hover:underline font-mono text-[0.75rem]"
+            >
+              {serverAddress}/api/health
+              <ExternalLink size={11} />
+            </a>
+          </div>
+        </div>
+        <p className="text-[0.75rem] text-mist">
+          If you see text starting with <code className="mono text-ink">{`{"app":"nexmind"`}</code>, the server is running and your browser is the problem.
+        </p>
+      </div>
+
+      {/* 4. Browser-specific instructions */}
+      <div className="space-y-1.5 rounded-lg bg-black/20 p-2.5 border hair">
+        <div className="font-semibold text-ink mb-1">Browser permissions &amp; troubleshooting:</div>
+
+        {/* Chrome / Edge */}
+        <div className="rounded border hair bg-black/30 overflow-hidden">
+          <button
+            type="button"
+            className="flex w-full items-center justify-between px-2.5 py-1.5 text-left text-xs hover:bg-white/[0.03]"
+            onClick={() => toggleBrowser('chrome')}
+          >
+            <span className="font-medium text-ink flex items-center gap-1.5">
+              <span>Chrome / Edge</span>
+              {detectedBrowser === 'chrome' && (
+                <span className="chip !text-[0.65rem] !py-0 !px-1.5 text-plankton border-plankton/30">
+                  Detected
+                </span>
+              )}
+            </span>
+            <ChevronDown
+              size={12}
+              className={`transition-transform duration-200 ${
+                expandedBrowsers.chrome ? 'rotate-180 text-ink' : 'text-mist'
+              }`}
+            />
+          </button>
+          {expandedBrowsers.chrome && (
+            <div className="px-2.5 pb-2 pt-1 border-t hair text-[0.75rem] text-mist">
+              Click the site-settings icon in the address bar, set &ldquo;Local network access&rdquo; to Allow, then reload.
+            </div>
+          )}
+        </div>
+
+        {/* Brave */}
+        <div className="rounded border hair bg-black/30 overflow-hidden">
+          <button
+            type="button"
+            className="flex w-full items-center justify-between px-2.5 py-1.5 text-left text-xs hover:bg-white/[0.03]"
+            onClick={() => toggleBrowser('brave')}
+          >
+            <span className="font-medium text-ink flex items-center gap-1.5">
+              <span>Brave</span>
+              {detectedBrowser === 'brave' && (
+                <span className="chip !text-[0.65rem] !py-0 !px-1.5 text-plankton border-plankton/30">
+                  Detected
+                </span>
+              )}
+            </span>
+            <ChevronDown
+              size={12}
+              className={`transition-transform duration-200 ${
+                expandedBrowsers.brave ? 'rotate-180 text-ink' : 'text-mist'
+              }`}
+            />
+          </button>
+          {expandedBrowsers.brave && (
+            <div className="px-2.5 pb-2 pt-1 border-t hair text-[0.75rem] text-mist">
+              Turn Shields off for this site.
+            </div>
+          )}
+        </div>
+
+        {/* Safari */}
+        <div className="rounded border hair bg-black/30 overflow-hidden">
+          <button
+            type="button"
+            className="flex w-full items-center justify-between px-2.5 py-1.5 text-left text-xs hover:bg-white/[0.03]"
+            onClick={() => toggleBrowser('safari')}
+          >
+            <span className="font-medium text-ink flex items-center gap-1.5">
+              <span>Safari</span>
+              {detectedBrowser === 'safari' && (
+                <span className="chip !text-[0.65rem] !py-0 !px-1.5 text-plankton border-plankton/30">
+                  Detected
+                </span>
+              )}
+            </span>
+            <ChevronDown
+              size={12}
+              className={`transition-transform duration-200 ${
+                expandedBrowsers.safari ? 'rotate-180 text-ink' : 'text-mist'
+              }`}
+            />
+          </button>
+          {expandedBrowsers.safari && (
+            <div className="px-2.5 pb-2 pt-1 border-t hair text-[0.75rem] text-mist">
+              Use &ldquo;Open NexMind on this computer&rdquo;.
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 5. Listening indicator & Check again now */}
       <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-black/25 px-3 py-2 border hair">
         <div className="flex items-center gap-2 min-w-0">
           <span
@@ -143,6 +308,30 @@ export function ServerConnectSteps({ compact = true }: ServerConnectStepsProps) 
             <span className="text-mist/70 text-[0.7rem] shrink-0">({attempts} checks)</span>
           )}
         </div>
+
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={handleCheckAgain}
+            disabled={isCheckingInline}
+            className="btn btn-ghost btn-sm !h-7 !px-2.5 !text-xs font-medium"
+          >
+            <RefreshCw size={12} className={isCheckingInline ? 'animate-spin' : ''} />
+            <span>Check again now</span>
+          </button>
+          {checkResult && (
+            <span
+              className={`text-[0.75rem] font-medium ${
+                checkResult === 'Connected' ? 'text-plankton' : 'text-amber'
+              }`}
+            >
+              {checkResult}
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div className="flex justify-end">
         <a
           href="http://127.0.0.1:8000/app"
           target="_blank"
@@ -154,7 +343,7 @@ export function ServerConnectSteps({ compact = true }: ServerConnectStepsProps) 
         </a>
       </div>
 
-      {/* 4. Diagnosis card */}
+      {/* 6. Custom port / host form */}
       <div className="rounded-lg border hair bg-black/15 overflow-hidden">
         <button
           type="button"
@@ -163,7 +352,7 @@ export function ServerConnectSteps({ compact = true }: ServerConnectStepsProps) 
           aria-expanded={showDiag}
         >
           <span className="flex items-center gap-1.5 font-medium text-ink">
-            <AlertCircle size={13} className="text-mist" /> Still not connected?
+            <AlertCircle size={13} className="text-mist" /> Custom server URL
           </span>
           <ChevronDown
             size={14}
@@ -174,31 +363,7 @@ export function ServerConnectSteps({ compact = true }: ServerConnectStepsProps) 
         </button>
 
         {showDiag && (
-          <div className="px-3 pb-3 pt-1 space-y-2.5 border-t hair text-xs text-mist leading-relaxed">
-            <ul className="list-disc pl-4 space-y-1.5">
-              <li>
-                <strong className="text-ink">Direct test link:</strong> Open{' '}
-                <a
-                  href={`${serverAddress}/api/health`}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-plankton underline"
-                >
-                  {serverAddress}/api/health
-                </a>{' '}
-                in a new tab to see if the server responds directly.
-              </li>
-              <li>
-                <strong className="text-ink">Chrome / Edge permissions:</strong> If asked to access devices on your local network, choose <strong>Allow</strong>.
-              </li>
-              <li>
-                <strong className="text-ink">Brave Shields:</strong> Turn Shields down for this site if Brave blocks HTTP connections to localhost.
-              </li>
-              <li>
-                <strong className="text-ink">Safari:</strong> Safari restricts HTTPS pages from accessing local HTTP servers. Use Chrome, Edge, or Firefox, or click &ldquo;Open NexMind on this computer instead&rdquo; above.
-              </li>
-            </ul>
-
+          <div className="px-3 pb-3 pt-1 space-y-2 border-t hair text-xs text-mist leading-relaxed">
             <form onSubmit={handleCustomConnect} className="pt-1">
               <label htmlFor="custom-server-url" className="block text-[0.7rem] text-mist mb-1">
                 Custom server URL (if running on another port or host):
@@ -217,7 +382,7 @@ export function ServerConnectSteps({ compact = true }: ServerConnectStepsProps) 
                   className="btn btn-ghost btn-sm !h-7 !px-2.5 !text-xs whitespace-nowrap"
                 >
                   <RefreshCw size={11} className={checkingCustom ? 'animate-spin' : ''} />
-                  Check again now
+                  Connect
                 </button>
               </div>
             </form>

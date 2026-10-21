@@ -53,6 +53,7 @@ class Settings:
     cors_origins: list[str] = field(
         default_factory=lambda: [o.strip() for o in os.environ.get("NEXMIND_CORS_ORIGINS", "*").split(",") if o.strip()]
     )
+    cors_origin_regex: str | None = os.environ.get("NEXMIND_CORS_ORIGIN_REGEX")
 
     # --- ingestion limits (protect your machine from zip bombs / huge uploads) ---
     max_upload_mb: int = _int("NEXMIND_MAX_UPLOAD_MB", 300)

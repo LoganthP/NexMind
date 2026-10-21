@@ -222,9 +222,20 @@ const q = (o: Record<string, string | number | boolean | undefined | null>) => {
 
 export const api = {
   /** Used by the connect screen: short timeout, explicit base, validates that it is really NexMind. */
-  async probe(base: string, timeoutMs = 2500): Promise<Health | null> {
+  async probe(
+    base: string,
+    timeoutMs = 2500,
+    options?: { isUserGesture?: boolean; targetAddressSpace?: 'local' }
+  ): Promise<Health | null> {
     try {
-      const h = await request<Health>('/api/health', {}, base.replace(/\/+$/, ''), timeoutMs)
+      const cleanBase = base.replace(/\/+$/, '')
+      const init: RequestInit & { targetAddressSpace?: string } = {}
+      if (options?.targetAddressSpace) {
+        init.targetAddressSpace = options.targetAddressSpace
+      } else if (options?.isUserGesture && typeof Request !== 'undefined' && 'targetAddressSpace' in Request.prototype) {
+        init.targetAddressSpace = 'local'
+      }
+      const h = await request<Health>('/api/health', init, cleanBase, timeoutMs)
       return h && h.app === 'nexmind' ? h : null
     } catch { return null }
   },

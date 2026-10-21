@@ -81,6 +81,73 @@ if not _native_pna:  # older Starlette: add the header ourselves
     app.add_middleware(PrivateNetworkAccess)
 
 
+import re
+
+
+def is_origin_allowed(origin: str | None) -> bool:
+    if not origin:
+        return True
+    origins = settings.cors_origins
+    if "*" in origins:
+        return True
+    if origin in origins:
+        return True
+    regex = settings.cors_origin_regex
+    if regex and re.match(regex, origin):
+        return True
+    return False
+
+
+class PingPermissiveMiddleware:
+    """Outermost pure-ASGI middleware specifically for /api/ping.
+    Answers OPTIONS preflights with 204 and CORS/PNA headers.
+    Ensures GET /api/ping responses carry Access-Control-Allow-Origin: * and Access-Control-Allow-Private-Network: true."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            if path == "/api/ping":
+                method = scope.get("method", "").upper()
+                if method == "OPTIONS":
+                    headers = [
+                        (b"access-control-allow-origin", b"*"),
+                        (b"access-control-allow-methods", b"GET, OPTIONS"),
+                        (b"access-control-allow-headers", b"*"),
+                        (b"access-control-allow-private-network", b"true"),
+                        (b"access-control-max-age", b"86400"),
+                    ]
+                    await send({
+                        "type": "http.response.start",
+                        "status": 204,
+                        "headers": headers,
+                    })
+                    await send({"type": "http.response.body", "body": b""})
+                    return
+
+                if method == "GET":
+                    async def send_wrapper(message):
+                        if message["type"] == "http.response.start":
+                            headers = [
+                                (k, v) for k, v in message.get("headers", [])
+                                if k.lower() not in (b"access-control-allow-origin", b"access-control-allow-private-network")
+                            ]
+                            headers.append((b"access-control-allow-origin", b"*"))
+                            headers.append((b"access-control-allow-private-network", b"true"))
+                            message = {**message, "headers": headers}
+                        await send(message)
+
+                    await self.app(scope, receive, send_wrapper)
+                    return
+
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(PingPermissiveMiddleware)
+
+
 @app.exception_handler(IngestError)
 async def ingest_error_handler(_: Request, exc: IngestError):
     return JSONResponse(status_code=400, content={"detail": str(exc)})
@@ -103,6 +170,19 @@ app.include_router(chat_routes.router)
 app.include_router(ws.router)
 app.include_router(connect.router)
 app.include_router(connect_script.router)
+
+
+@app.get("/api/ping", tags=["system"])
+def ping(request: Request) -> dict:
+    origin = request.headers.get("origin")
+    allowed = is_origin_allowed(origin)
+    return {
+        "app": "nexmind",
+        "ok": True,
+        "version": __version__,
+        "origin_allowed": allowed,
+        "origin": origin,
+    }
 
 
 @app.get("/api/health", tags=["system"])
