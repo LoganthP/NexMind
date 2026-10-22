@@ -178,6 +178,28 @@ def test_stale_running_job_can_be_taken_over(client):
     assert evs[-1]["type"] == "job_done"
 
 
+def test_connect_upload_browser_hint_reuses_workspace(client):
+    hint = "browser:myproject:stable-id-123"
+    uid1 = chunked_upload(client, KEY_A, "myproject.zip", sample_zip())
+    r1 = client.post("/api/connect/upload", json={"upload_id": uid1, "path_hint": hint, "name": "myproject", "watch": True}, headers=H(KEY_A))
+    assert r1.status_code == 200, r1.text
+    d1 = r1.json()
+    assert d1["reused"] is False
+    ws_id = d1["workspace_id"]
+    evs1 = run_job(client, KEY_A, d1["job_id"])
+    assert evs1[-1]["type"] == "job_done"
+
+    # Second upload with the same browser hint reuses the workspace
+    uid2 = chunked_upload(client, KEY_A, "myproject.zip", sample_zip())
+    r2 = client.post("/api/connect/upload", json={"upload_id": uid2, "path_hint": hint, "name": "myproject", "watch": True}, headers=H(KEY_A))
+    assert r2.status_code == 200, r2.text
+    d2 = r2.json()
+    assert d2["reused"] is True
+    assert d2["workspace_id"] == ws_id
+    evs2 = run_job(client, KEY_A, d2["job_id"])
+    assert evs2[-1]["type"] == "job_done"
+
+
 def test_repo_archive_urls():
     from nexmind.ingest.remote import archive_request
 

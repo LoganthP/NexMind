@@ -6,9 +6,10 @@ export interface PackFolderResult {
   totalBytes: number
   formattedSize: string
   label: string
+  skippedFolders: string[]
 }
 
-const EXCLUDED_FOLDERS = new Set([
+export const EXCLUDED_FOLDERS = new Set([
   'node_modules',
   '.git',
   'dist',
@@ -157,14 +158,27 @@ export async function packFolder(
   const zippable: Record<string, Uint8Array> = {}
   let totalBytes = 0
   let fileCount = 0
+  const skippedFoldersSet = new Set<string>()
 
   for (const f of fileArray) {
     const relPath = getRelativePath(f)
+    const segments = relPath.split('/')
+    for (const seg of segments.slice(0, -1)) {
+      if (EXCLUDED_FOLDERS.has(seg.toLowerCase())) {
+        skippedFoldersSet.add(seg)
+      }
+    }
+
     if (!shouldIncludeFile(relPath, f.size, mode)) {
       continue
     }
 
     totalBytes += f.size
+    if (mode === 'code' && totalBytes > 120 * 1024 * 1024) {
+      throw new Error(
+        'Folder is larger than 120 MB after skipping dependencies; choose a sub-folder such as src'
+      )
+    }
     if (totalBytes > 300 * 1024 * 1024) {
       throw new Error(
         `Folder content exceeds 300 MB limit (${(totalBytes / (1024 * 1024)).toFixed(1)} MB). Choose a smaller folder or remove large files.`
@@ -180,7 +194,7 @@ export async function packFolder(
     throw new Error(
       mode === 'docs'
         ? 'No supported document files found in this folder (.pdf, .docx, .md, .txt, .html).'
-        : 'No supported code files found in this folder.'
+        : 'This folder has no source files we can analyze'
     )
   }
 
@@ -202,5 +216,73 @@ export async function packFolder(
     totalBytes,
     formattedSize,
     label,
+    skippedFolders: Array.from(skippedFoldersSet).sort(),
   }
+}
+
+export async function getFilesFromDataTransfer(dataTransfer: DataTransfer): Promise<File[]> {
+  const items = dataTransfer.items
+  if (!items || items.length === 0) {
+    return Array.from(dataTransfer.files || [])
+  }
+
+  const files: File[] = []
+
+  async function traverseEntry(entry: any, path = ''): Promise<void> {
+    if (!entry) return
+    if (entry.isFile) {
+      await new Promise<void>((resolve) => {
+        entry.file(
+          (file: File) => {
+            const relPath = path ? `${path}/${file.name}` : file.name
+            try {
+              Object.defineProperty(file, 'webkitRelativePath', {
+                value: relPath,
+                configurable: true,
+              })
+            } catch {
+              // ignore
+            }
+            files.push(file)
+            resolve()
+          },
+          () => resolve()
+        )
+      })
+    } else if (entry.isDirectory) {
+      const dirReader = entry.createReader()
+      const readBatch = (): Promise<any[]> =>
+        new Promise((resolve) => {
+          dirReader.readEntries(
+            (entries: any[]) => resolve(entries || []),
+            () => resolve([])
+          )
+        })
+      let batch: any[]
+      do {
+        batch = await readBatch()
+        for (const child of batch) {
+          await traverseEntry(child, path ? `${path}/${entry.name}` : entry.name)
+        }
+      } while (batch.length > 0)
+    }
+  }
+
+  const entries: any[] = []
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i]
+    if (typeof item.webkitGetAsEntry === 'function') {
+      const entry = item.webkitGetAsEntry()
+      if (entry) entries.push(entry)
+    }
+  }
+
+  if (entries.length > 0) {
+    for (const entry of entries) {
+      await traverseEntry(entry)
+    }
+    return files
+  }
+
+  return Array.from(dataTransfer.files || [])
 }

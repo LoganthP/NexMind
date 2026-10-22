@@ -89,7 +89,7 @@ describe('NewWorkspaceDialog and Live Connect experience', () => {
 
     // Step 2 should display command blocks and "Waiting for your project"
     expect(await screen.findByText(/Waiting for your project/i)).toBeTruthy()
-    expect(screen.getByText(/Open your project in VS Code/i)).toBeTruthy()
+    expect(screen.getByText(/(Best option: run this in your project's terminal|Open your project in VS Code)/i)).toBeTruthy()
     expect(screen.getAllByText(/nexmind connect \./i).length).toBeGreaterThan(0)
 
     // Must NOT show GitHub/GitLab/Azure/Upload tabs

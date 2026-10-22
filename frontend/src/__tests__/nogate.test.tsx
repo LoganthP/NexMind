@@ -117,7 +117,7 @@ describe('requirement 5: acceptance and guard rails', () => {
     fireEvent.click(liveCard)
 
     // Shows command card
-    expect(await screen.findByText(/Open your project in VS Code/i)).toBeTruthy()
+    expect(await screen.findByText(/(Best option: run this in your project's terminal|Open your project in VS Code)/i)).toBeTruthy()
     expect(screen.queryByText(/Step 1 of 2: connect the NexMind server/i)).toBeNull()
     expect(document.body.textContent).not.toContain(FORBIDDEN_SCREEN_TEXT)
 

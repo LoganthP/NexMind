@@ -18,7 +18,7 @@ import {
 } from 'lucide-react'
 import { api, formatApiError, uploadFiles } from '@/lib/api'
 import { useServer } from '@/lib/server'
-import { packFolder } from '@/lib/folderUpload'
+import { packFolder, getFilesFromDataTransfer, type PackFolderResult } from '@/lib/folderUpload'
 import type { FsCheckResult } from '@/lib/types'
 import { FolderPicker } from '../FolderPicker'
 import { ServerStatusBar } from '../ServerStatusBar'
@@ -102,6 +102,13 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
   const [packing, setPacking] = useState(false)
   const [packNote, setPackNote] = useState<string | null>(null)
 
+  // Hosted local folder packing
+  const [packedLocalFolder, setPackedLocalFolder] = useState<PackFolderResult | null>(null)
+  const [localFolderName, setLocalFolderName] = useState('')
+  const [packingLocal, setPackingLocal] = useState(false)
+  const [localDragOver, setLocalDragOver] = useState(false)
+  const localFolderInputRef = useRef<HTMLInputElement>(null)
+
   // Status & pending
   const [busy, setBusy] = useState(false)
   const [pct, setPct] = useState<number | null>(null)
@@ -114,20 +121,32 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
   const inFlightRef = useRef(false)
 
   const isGit = tab === 'github' || tab === 'gitlab' || tab === 'azure'
+  const canPickFolder =
+    typeof window !== 'undefined' &&
+    !(window as any).__MOCK_UNSUPPORTED_FOLDER_BROWSER__ &&
+    ('webkitdirectory' in HTMLInputElement.prototype ||
+      typeof (window as any).showDirectoryPicker === 'function' ||
+      process.env.NODE_ENV === 'test')
 
   // Readiness validation
   const isReady = isGit
     ? validateRepoUrl(url, tab)
     : tab === 'local'
-      ? path.trim().length > 0
+      ? localOk
+        ? path.trim().length > 0
+        : files.length > 0
       : files.length > 0
 
   // Derive default workspace name
   let defaultName = 'My workspace'
   if (isGit && url.trim()) {
     defaultName = nameFromUrl(url.trim())
-  } else if (tab === 'local' && path.trim()) {
-    defaultName = path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'Local project'
+  } else if (tab === 'local') {
+    if (localOk && path.trim()) {
+      defaultName = path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'Local project'
+    } else if (!localOk && localFolderName) {
+      defaultName = localFolderName
+    }
   } else if (files.length > 0) {
     defaultName = files[0].name.replace(/\.[^.]+$/, '')
   }
@@ -206,6 +225,30 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
     }
   }
 
+  const handleHostedFolderPick = async (folderFiles: FileList | File[]) => {
+    setError(null)
+    setPackingLocal(true)
+    try {
+      const arr = Array.from(folderFiles)
+      const firstRel = (arr[0] as any)?.webkitRelativePath || arr[0]?.name || ''
+      const folderName = firstRel.split('/')[0] || 'project'
+      setLocalFolderName(folderName)
+
+      const res = await packFolder(arr, 'code', folderName)
+      setPackedLocalFolder(res)
+      setFiles([res.file])
+      if (!name) {
+        setName(folderName)
+      }
+    } catch (err: any) {
+      setPackedLocalFolder(null)
+      setFiles([])
+      setError(err?.message || 'Could not pack project folder.')
+    } finally {
+      setPackingLocal(false)
+    }
+  }
+
   const handleDropArchive = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault()
     setDragOver(false)
@@ -246,7 +289,11 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
         }
         job = await api.ingestGit(wsId, fullUrl, token.trim() || undefined, branch.trim() || undefined)
       } else if (tab === 'local') {
-        job = await api.ingestLocal(wsId, path.trim())
+        if (localOk) {
+          job = await api.ingestLocal(wsId, path.trim())
+        } else {
+          job = await uploadFiles(wsId, files, setPct)
+        }
       } else {
         job = await uploadFiles(wsId, files, setPct)
       }
@@ -261,7 +308,7 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
       setPct(null)
       inFlightRef.current = false
     }
-  }, [isReady, name, defaultName, workspaceId, isGit, url, token, branch, tab, path, files, onStarted])
+  }, [isReady, name, defaultName, workspaceId, isGit, url, token, branch, tab, localOk, path, files, onStarted])
 
   useEffect(() => {
     if (pending && isOnline && !inFlightRef.current) {
@@ -293,7 +340,7 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
 
       {/* Tabs */}
       <div role="tablist" aria-label="Project source" className="flex flex-wrap gap-1">
-        {TABS.filter((t) => t.id !== 'local' || localOk).map((t) => {
+        {TABS.map((t) => {
           const Icon = t.icon
           const isSelected = tab === t.id
           return (
@@ -493,78 +540,201 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
 
         {/* Local folder tab */}
         {tab === 'local' && (
-          <div className="space-y-3">
-            <div>
-              <label className="block text-xs font-medium text-mist mb-1.5">
-                Folder on this computer <span className="text-mist/60">(project root or source subfolder)</span>
-              </label>
+          localOk ? (
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-medium text-mist mb-1.5">
+                  Folder on this computer <span className="text-mist/60">(project root or source subfolder)</span>
+                </label>
 
-              <div className="flex gap-2">
-                <input
-                  className="field mono text-sm flex-1"
-                  value={path}
-                  onChange={(e) => {
-                    const val = e.target.value
-                    setPath(val)
-                    setError(null)
-                    runPathCheck(val)
-                  }}
-                  placeholder={currentMeta.placeholder}
-                  spellCheck={false}
-                  onKeyDown={(e) => e.key === 'Enter' && handleSubmit()}
-                />
+                <div className="flex gap-2">
+                  <input
+                    className="field mono text-sm flex-1"
+                    value={path}
+                    onChange={(e) => {
+                      const val = e.target.value
+                      setPath(val)
+                      setError(null)
+                      runPathCheck(val)
+                    }}
+                    placeholder={currentMeta.placeholder}
+                    spellCheck={false}
+                    onKeyDown={(e) => e.key === 'Enter' && handleSubmit()}
+                  />
 
+                  <button
+                    type="button"
+                    className="btn btn-ghost shrink-0 flex items-center gap-1.5 !h-10 !px-3.5 text-xs font-medium"
+                    disabled={pickingNative}
+                    onClick={handlePickFolderNative}
+                  >
+                    {pickingNative ? (
+                      <Loader2 size={15} className="animate-spin text-plankton" />
+                    ) : (
+                      <FolderOpen size={15} className="text-plankton" />
+                    )}
+                    <span>{pickingNative ? 'Opening…' : 'Browse…'}</span>
+                  </button>
+                </div>
+
+                {pickingNative && (
+                  <div className="mt-2 flex items-center gap-2 text-xs text-plankton/90 bg-plankton/5 border border-plankton/20 rounded-lg p-2">
+                    <Loader2 size={13} className="animate-spin shrink-0" />
+                    <span>Waiting for the folder window on your computer… (it may open behind the browser)</span>
+                  </div>
+                )}
+
+                {/* Live summary under path */}
+                <div className="mt-2 text-xs">
+                  {checkingPath ? (
+                    <span className="text-mist flex items-center gap-1.5">
+                      <Loader2 size={12} className="animate-spin" /> Checking folder…
+                    </span>
+                  ) : checkInfo ? (
+                    <div className={`p-2 rounded-lg border ${
+                      checkInfo.ok
+                        ? 'border-plankton/30 bg-plankton/5 text-ink'
+                        : 'border-amber/30 bg-amber/5 text-amber'
+                    }`}>
+                      {checkInfo.message}
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between text-[0.72rem] text-mist">
+                <span>Indexed in place. Nothing is copied or changed.</span>
                 <button
                   type="button"
-                  className="btn btn-ghost shrink-0 flex items-center gap-1.5 !h-10 !px-3.5 text-xs font-medium"
-                  disabled={pickingNative}
-                  onClick={handlePickFolderNative}
+                  className="text-mist hover:text-plankton underline"
+                  onClick={() => setPickerModalOpen(true)}
                 >
-                  {pickingNative ? (
-                    <Loader2 size={15} className="animate-spin text-plankton" />
-                  ) : (
-                    <FolderOpen size={15} className="text-plankton" />
-                  )}
-                  <span>{pickingNative ? 'Opening…' : 'Browse…'}</span>
+                  Browse inside NexMind
                 </button>
               </div>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {!packedLocalFolder ? (
+                <div
+                  onDragOver={(e) => {
+                    e.preventDefault()
+                    setLocalDragOver(true)
+                  }}
+                  onDragLeave={() => setLocalDragOver(false)}
+                  onDrop={async (e) => {
+                    e.preventDefault()
+                    setLocalDragOver(false)
+                    if (e.dataTransfer) {
+                      const dropped = await getFilesFromDataTransfer(e.dataTransfer)
+                      if (dropped.length > 0) {
+                        void handleHostedFolderPick(dropped)
+                      }
+                    }
+                  }}
+                  className={`relative flex flex-col items-center justify-center rounded-2xl border-2 border-dashed p-6 text-center transition-all ${
+                    localDragOver
+                      ? 'border-plankton bg-plankton/10'
+                      : 'border-white/10 bg-white/[0.02] hover:border-white/20 hover:bg-white/[0.03]'
+                  }`}
+                >
+                  <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-plankton/10 text-plankton mb-3">
+                    <FolderOpen size={24} />
+                  </div>
 
-              {pickingNative && (
-                <div className="mt-2 flex items-center gap-2 text-xs text-plankton/90 bg-plankton/5 border border-plankton/20 rounded-lg p-2">
-                  <Loader2 size={13} className="animate-spin shrink-0" />
-                  <span>Waiting for the folder window on your computer… (it may open behind the browser)</span>
+                  <p className="text-sm font-medium text-ink">
+                    Choose a project folder
+                  </p>
+                  <p className="mt-1 text-xs text-mist max-w-[46ch] leading-relaxed">
+                    Pick your project folder (or just its src folder). Your browser packs the source files and uploads them; nothing else on your computer is read.
+                  </p>
+
+                  <div className="mt-4 flex flex-wrap items-center justify-center gap-2.5">
+                    {canPickFolder ? (
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-sm flex items-center gap-1.5 !h-9 !px-4 text-xs font-semibold"
+                        onClick={() => localFolderInputRef.current?.click()}
+                        disabled={packingLocal}
+                      >
+                        {packingLocal ? (
+                          <Loader2 size={15} className="animate-spin text-ink" />
+                        ) : (
+                          <FolderOpen size={15} className="text-ink" />
+                        )}
+                        <span>{packingLocal ? 'Packing folder…' : 'Choose folder…'}</span>
+                      </button>
+                    ) : (
+                      <p className="text-xs text-amber">
+                        Your browser cannot pick folders; zip the folder and use Upload project instead.
+                      </p>
+                    )}
+
+                    <input
+                      ref={localFolderInputRef}
+                      type="file"
+                      multiple
+                      hidden
+                      {...({ webkitdirectory: '', directory: '' } as any)}
+                      onChange={(e) => {
+                        if (e.target.files && e.target.files.length > 0) {
+                          void handleHostedFolderPick(e.target.files)
+                        }
+                        e.target.value = ''
+                      }}
+                    />
+                  </div>
+                </div>
+              ) : (
+                <div className="rounded-2xl border hair bg-black/20 p-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <FolderOpen size={18} className="text-plankton" />
+                      <span className="text-sm font-semibold text-ink">
+                        Packed {packedLocalFolder.fileCount} files · {(packedLocalFolder.totalBytes / (1024 * 1024)).toFixed(1)} MB from {localFolderName}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      className="text-xs text-mist hover:text-plankton underline cursor-pointer"
+                      onClick={() => {
+                        setPackedLocalFolder(null)
+                        setFiles([])
+                        setTimeout(() => localFolderInputRef.current?.click(), 0)
+                      }}
+                    >
+                      Change
+                    </button>
+                  </div>
+
+                  <input
+                    ref={localFolderInputRef}
+                    type="file"
+                    multiple
+                    hidden
+                    {...({ webkitdirectory: '', directory: '' } as any)}
+                    onChange={(e) => {
+                      if (e.target.files && e.target.files.length > 0) {
+                        void handleHostedFolderPick(e.target.files)
+                      }
+                      e.target.value = ''
+                    }}
+                  />
+
+                  {packedLocalFolder.skippedFolders && packedLocalFolder.skippedFolders.length > 0 && (
+                    <details className="text-xs text-mist">
+                      <summary className="cursor-pointer hover:text-ink transition-colors">
+                        Skipped ({packedLocalFolder.skippedFolders.length} folders)
+                      </summary>
+                      <div className="mt-1.5 p-2 rounded-lg bg-black/30 border hair font-mono text-[0.7rem] text-mist/80">
+                        {packedLocalFolder.skippedFolders.join(', ')}
+                      </div>
+                    </details>
+                  )}
                 </div>
               )}
-
-              {/* Live summary under path */}
-              <div className="mt-2 text-xs">
-                {checkingPath ? (
-                  <span className="text-mist flex items-center gap-1.5">
-                    <Loader2 size={12} className="animate-spin" /> Checking folder…
-                  </span>
-                ) : checkInfo ? (
-                  <div className={`p-2 rounded-lg border ${
-                    checkInfo.ok
-                      ? 'border-plankton/30 bg-plankton/5 text-ink'
-                      : 'border-amber/30 bg-amber/5 text-amber'
-                  }`}>
-                    {checkInfo.message}
-                  </div>
-                ) : null}
-              </div>
             </div>
-
-            <div className="flex items-center justify-between text-[0.72rem] text-mist">
-              <span>Indexed in place. Nothing is copied or changed.</span>
-              <button
-                type="button"
-                className="text-mist hover:text-plankton underline"
-                onClick={() => setPickerModalOpen(true)}
-              >
-                Browse inside NexMind
-              </button>
-            </div>
-          </div>
+          )
         )}
 
         {/* Workspace Name */}

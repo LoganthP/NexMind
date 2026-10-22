@@ -294,6 +294,11 @@ export const api = {
     request<{ path: string | null; cancelled: boolean }>('/api/fs/pick', { method: 'POST', body: j({ title, initial }) }),
   connect: (path: string, name?: string, watch = true) =>
     request<{ workspace_id: string; job_id: string; name: string; url: string; reused: boolean }>('/api/connect', { method: 'POST', body: j({ path, name, watch }) }),
+  connectUpload: (uploadId: string, pathHint: string, name?: string, watch = true) =>
+    request<{ workspace_id: string; job_id: string; name: string; url: string; reused: boolean }>('/api/connect/upload', {
+      method: 'POST',
+      body: j({ upload_id: uploadId, path_hint: pathHint, name: name || undefined, watch }),
+    }),
   connectSessions: (since = 0) =>
     request<{ now: number; sessions: { workspace_id: string; name: string; path: string; job_id: string; created_at: number; reused: boolean }[] }>(`/api/connect/sessions${q({ since })}`),
   setSourceWatch: (id: string, sid: string, enabled: boolean) =>

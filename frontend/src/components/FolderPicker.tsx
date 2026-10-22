@@ -13,6 +13,7 @@ import {
   AlertCircle,
 } from 'lucide-react'
 import { api, formatApiError } from '@/lib/api'
+import { useServer } from '@/lib/server'
 import type { FsEntry, FsListing, FsCheckResult } from '@/lib/types'
 import { Modal } from './Modal'
 import { Spinner } from './ui'
@@ -52,6 +53,9 @@ interface Props {
 }
 
 export function FolderPicker({ onPick, onClose, initialPath }: Props) {
+  const localOk = useServer((st) => st.health?.capabilities?.local_paths ?? true)
+  const hostedInputRef = useRef<HTMLInputElement>(null)
+
   const [data, setData] = useState<FsListing | null>(null)
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(true)
@@ -91,8 +95,10 @@ export function FolderPicker({ onPick, onClose, initialPath }: Props) {
   }, [])
 
   useEffect(() => {
-    load(initialPath)
-  }, [load, initialPath])
+    if (localOk) {
+      load(initialPath)
+    }
+  }, [load, initialPath, localOk])
 
   // Run live check when selectedPath changes
   useEffect(() => {
@@ -320,6 +326,74 @@ export function FolderPicker({ onPick, onClose, initialPath }: Props) {
             )}
           </div>
         )}
+      </div>
+    )
+  }
+
+  if (!localOk) {
+    return (
+      <div className="relative z-[60]">
+        <Modal
+          open={true}
+          onClose={onClose}
+          maxWidth="min(540px, calc(100vw - 2rem))"
+          title="Choose a project folder"
+          subtitle="Select a folder to analyze"
+          footer={
+            <div className="flex w-full items-center justify-end gap-2 border-t border-line/50 pt-3">
+              <button type="button" className="btn btn-ghost btn-sm !h-8" onClick={onClose}>
+                Cancel
+              </button>
+            </div>
+          }
+        >
+          <div className="flex flex-col items-center justify-center gap-3 py-6 text-center">
+            <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-plankton/10 text-plankton mb-1">
+              <FolderOpen size={24} />
+            </div>
+            <p className="text-sm text-ink max-w-[42ch] leading-relaxed">
+              Choosing folders by path only works when NexMind runs on your computer. Use &apos;Choose folder…&apos; instead.
+            </p>
+            <button
+              type="button"
+              className="btn btn-primary btn-sm mt-2 flex items-center gap-1.5 !h-9 !px-4 text-xs font-semibold"
+              onClick={async () => {
+                if (typeof window !== 'undefined' && typeof (window as any).showDirectoryPicker === 'function') {
+                  try {
+                    const handle = await (window as any).showDirectoryPicker({ mode: 'read' })
+                    if (handle?.name) {
+                      onPick(handle.name)
+                      onClose()
+                      return
+                    }
+                  } catch (e: any) {
+                    if (e?.name === 'AbortError') return
+                  }
+                }
+                hostedInputRef.current?.click()
+              }}
+            >
+              <FolderOpen size={15} />
+              <span>Choose folder…</span>
+            </button>
+            <input
+              ref={hostedInputRef}
+              type="file"
+              multiple
+              hidden
+              {...({ webkitdirectory: '', directory: '' } as any)}
+              onChange={(e) => {
+                if (e.target.files && e.target.files.length > 0) {
+                  const arr = Array.from(e.target.files)
+                  const firstRel = (arr[0] as any)?.webkitRelativePath || arr[0]?.name || ''
+                  const folderName = firstRel.split('/')[0] || 'project'
+                  onPick(folderName)
+                  onClose()
+                }
+              }}
+            />
+          </div>
+        </Modal>
       </div>
     )
   }

@@ -105,7 +105,11 @@ def connect_upload(body: ConnectUploadIn) -> dict:
     """Upload mode: the connect command uploaded a zip of the folder (hosted NexMind)."""
     require_storage()
     hint = body.path_hint.strip()
-    folder_name = Path(hint.replace("\\", "/")).name or "project"
+    if hint.startswith("browser:"):
+        parts = hint.split(":")
+        folder_name = parts[1] if len(parts) > 1 and parts[1] else "project"
+    else:
+        folder_name = Path(hint.replace("\\", "/")).name or "project"
     name = (body.name or "").strip() or folder_name
     clause, params = _owner_clause()
     existing = db.one(

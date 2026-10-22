@@ -106,7 +106,7 @@ describe('Section 6: New Workspace Experience Tests', () => {
 
     // Verify Live connect tools
     expect(screen.queryByText(/Step 1 of 2/i)).toBeNull()
-    expect(screen.getByText(/Open your project in VS Code/i)).toBeTruthy()
+    expect(screen.getByText(/(Best option: run this in your project's terminal|Open your project in VS Code)/i)).toBeTruthy()
     expect(screen.getByText(/Waiting for your project/i)).toBeTruthy()
     expect(screen.getByText(/No terminal\? Pick the folder here/i)).toBeTruthy()
     // No GitHub tabs or document dropzone
