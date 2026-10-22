@@ -2,6 +2,7 @@ import type {
   ChatMessage, EdgeDetail, FsListing, GraphPayload, Health, ImpactResult, Insight, JobInfo, NodeDetail, ProcessItem,
   Retrieval, SearchResult, SourceItem, Thread, TraceResult, TreeNode, Workspace, Citation,
 } from './types'
+import { beginActivity, endActivity } from './server'
 
 const KEY = 'nexmind.api.v2' // v1 stored http://127.0.0.1:8000 on hosted sites; ignored from now on
 const BROWSER_KEY = 'nexmind.key'
@@ -355,45 +356,193 @@ export const api = {
   renameThread: (id: string, tid: string, title: string) => request<Thread>(`/api/workspaces/${id}/threads/${tid}`, { method: 'PATCH', body: j({ title }) }),
   deleteThread: (id: string, tid: string) => request<void>(`/api/workspaces/${id}/threads/${tid}`, { method: 'DELETE' }),
   messages: (id: string, tid: string) => request<ChatMessage[]>(`/api/workspaces/${id}/threads/${tid}/messages`),
+
+  sourcesManifest: (
+    params: { path_hint?: string; workspace_id?: string; source_id?: string },
+    signal?: AbortSignal
+  ) =>
+    request<{ source_id: string | null; files: Record<string, string> }>(
+      '/api/sources/manifest',
+      { method: 'POST', body: j(params), signal }
+    ),
+  connectDelta: (
+    params: {
+      path_hint: string
+      upload_id?: string | null
+      deleted?: string[]
+      name?: string
+      watch?: boolean
+    },
+    signal?: AbortSignal
+  ) =>
+    request<{
+      session_id: string
+      workspace_id: string
+      name: string
+      reused: boolean
+      building?: boolean
+    }>('/api/connect/delta', { method: 'POST', body: j(params), signal }),
+  workspaceSourceDelta: (
+    wsId: string,
+    sid: string,
+    params: { upload_id?: string | null; deleted?: string[] },
+    signal?: AbortSignal
+  ) =>
+    request<{ job_id: string }>(
+      `/api/workspaces/${wsId}/sources/${sid}/delta`,
+      { method: 'POST', body: j(params), signal }
+    ),
+  getUpload: (id: string, signal?: AbortSignal) =>
+    request<{ upload_id: string; chunks: number; received: number[] }>(
+      `/api/uploads/${id}`,
+      { signal }
+    ),
 }
 
-/** Upload files with real progress (fetch cannot report upload progress). */
-/** Upload files in chunks (each request stays under Vercel's 4.5 MB limit) with real progress. */
-export async function uploadFiles(wsId: string, files: File[], onProgress: (pct: number) => void): Promise<{ job_id: string }> {
-  const total = files.reduce((n, f) => n + f.size, 0) || 1
-  let sent = 0
-  const ids: string[] = []
-  for (const f of files) {
-    const name = ((f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name).slice(0, 300)
-    const init = await request<{ upload_id: string; chunk_size: number; chunks: number }>('/api/uploads', { method: 'POST', body: j({ name, size: f.size }) })
-    for (let i = 0; i < init.chunks; i++) {
-      const part = f.slice(i * init.chunk_size, (i + 1) * init.chunk_size)
-      let attempt = 0
-      for (;;) {
-        try {
-          const res = await fetch(`${getApiBase()}/api/uploads/${init.upload_id}/chunks/${i}`, { method: 'PUT', headers: { ...authHeaders(), 'Content-Type': 'application/octet-stream' }, body: part })
-          if (!res.ok) {
-            let detail = `Upload failed (${res.status})`
-            try { const d = await res.json(); if (typeof d.detail === 'string') detail = d.detail } catch { /* not json */ }
-            throw new ApiError(detail, res.status)
-          }
-          break
-        } catch (e) {
-          attempt += 1
-          if (attempt >= 3 || (e instanceof ApiError && e.status >= 400 && e.status < 500)) {
-            throw e instanceof ApiError ? e : new ApiError('Cannot reach the NexMind server. Is it running?')
-          }
-          await new Promise((r) => setTimeout(r, 600 * attempt))
-        }
+/** Upload a single file/blob in chunks with 3 parallel requests, retry with backoff, and missing chunk resume. */
+export async function uploadChunkedFile(
+  file: File | Blob,
+  fileName: string,
+  onProgress?: (pct: number, text?: string) => void,
+  signal?: AbortSignal
+): Promise<string> {
+  const endActivity = beginActivity()
+  try {
+    const name = fileName.slice(0, 300)
+    const init = await request<{ upload_id: string; chunk_size: number; chunks: number }>(
+      '/api/uploads',
+      { method: 'POST', body: j({ name, size: file.size }), signal }
+    )
+
+    // Check received chunks for resume support
+    let received: number[] = []
+    try {
+      const statusRes = await request<{ upload_id: string; chunks: number; received: number[] }>(
+        `/api/uploads/${init.upload_id}`,
+        { signal }
+      )
+      if (Array.isArray(statusRes.received)) {
+        received = statusRes.received
       }
-      sent += part.size
-      onProgress(Math.min(99, Math.round((sent / total) * 100)))
+    } catch {
+      /* ignore if not yet available */
     }
-    ids.push(init.upload_id)
+
+    const missingIndexes: number[] = []
+    for (let i = 0; i < init.chunks; i++) {
+      if (!received.includes(i)) {
+        missingIndexes.push(i)
+      }
+    }
+
+    const totalBytes = file.size || 1
+    let sentBytes = received.length * init.chunk_size
+
+    const report = () => {
+      const mbSent = (Math.min(sentBytes, totalBytes) / (1024 * 1024)).toFixed(1)
+      const mbTotal = (totalBytes / (1024 * 1024)).toFixed(1)
+      const pct = Math.min(99, Math.round((sentBytes / totalBytes) * 100))
+      const text = `Uploading ${mbSent} / ${mbTotal} MB`
+      onProgress?.(pct, text)
+    }
+    report()
+
+    // 3 parallel requests with backoff and retry
+    const concurrency = 3
+    let nextIdx = 0
+
+    const worker = async () => {
+      while (nextIdx < missingIndexes.length) {
+        if (signal?.aborted) throw new Error('Upload cancelled')
+        const currentQueuePos = nextIdx++
+        const chunkIndex = missingIndexes[currentQueuePos]
+        const start = chunkIndex * init.chunk_size
+        const end = Math.min(start + init.chunk_size, file.size)
+        const part = file.slice(start, end)
+
+        let attempt = 0
+        for (;;) {
+          if (signal?.aborted) throw new Error('Upload cancelled')
+          try {
+            const res = await fetch(
+              `${getApiBase()}/api/uploads/${init.upload_id}/chunks/${chunkIndex}`,
+              {
+                method: 'PUT',
+                headers: { ...authHeaders(), 'Content-Type': 'application/octet-stream' },
+                body: part,
+                signal,
+              }
+            )
+            if (!res.ok) {
+              let detail = `Upload failed (${res.status})`
+              try {
+                const d = await res.json()
+                if (typeof d.detail === 'string') detail = d.detail
+              } catch {}
+              throw new ApiError(detail, res.status)
+            }
+            break
+          } catch (e: any) {
+            if (signal?.aborted || (e instanceof ApiError && e.status >= 400 && e.status < 500)) {
+              throw e instanceof ApiError ? e : new ApiError('Upload cancelled')
+            }
+            attempt++
+            if (attempt >= 3) {
+              throw e instanceof ApiError
+                ? e
+                : new ApiError('Cannot reach the NexMind server. Is it running?')
+            }
+            await new Promise((r) => setTimeout(r, 600 * attempt))
+          }
+        }
+
+        sentBytes += part.size
+        report()
+      }
+    }
+
+    const workers = []
+    for (let i = 0; i < Math.min(concurrency, missingIndexes.length); i++) {
+      workers.push(worker())
+    }
+    await Promise.all(workers)
+
+    onProgress?.(
+      100,
+      `Uploading ${(totalBytes / (1024 * 1024)).toFixed(1)} / ${(totalBytes / (1024 * 1024)).toFixed(1)} MB`
+    )
+    return init.upload_id
+  } finally {
+    endActivity()
   }
-  const res = await request<{ job_id: string }>(`/api/workspaces/${wsId}/ingest/uploads`, { method: 'POST', body: j({ upload_ids: ids }) }, getApiBase(), 300000)
-  onProgress(100)
-  return res
+}
+
+/** Upload files with real progress and activity tracking. */
+export async function uploadFiles(
+  wsId: string,
+  files: File[],
+  onProgress: (pct: number, text?: string) => void,
+  signal?: AbortSignal
+): Promise<{ job_id: string }> {
+  const endActivity = beginActivity()
+  try {
+    const ids: string[] = []
+    for (const f of files) {
+      const name = ((f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name).slice(0, 300)
+      const uploadId = await uploadChunkedFile(f, name, onProgress, signal)
+      ids.push(uploadId)
+    }
+    const res = await request<{ job_id: string }>(
+      `/api/workspaces/${wsId}/ingest/uploads`,
+      { method: 'POST', body: j({ upload_ids: ids }), signal },
+      getApiBase(),
+      300000
+    )
+    onProgress(100)
+    return res
+  } finally {
+    endActivity()
+  }
 }
 
 export interface ChatHandlers {

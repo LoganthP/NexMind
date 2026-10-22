@@ -15,6 +15,7 @@ import { api, formatApiError, uploadFiles } from '@/lib/api'
 import { useServer } from '@/lib/server'
 import { packFolder } from '@/lib/folderUpload'
 import { ServerStatusBar } from '../ServerStatusBar'
+import { FolderReview } from '../FolderReview'
 
 interface DocumentsFormProps {
   onStarted?: (jobId: string, workspaceId: string) => void
@@ -52,6 +53,14 @@ export function DocumentsForm({ onStarted, workspaceId }: DocumentsFormProps) {
   const { status, health } = useServer()
   const isOnline = status === 'online'
 
+  useEffect(() => {
+    if (!health?.setup_required) return
+    const id = setInterval(() => {
+      void useServer.getState().check(true)
+    }, 10000)
+    return () => clearInterval(id)
+  }, [health?.setup_required])
+
   const [files, setFiles] = useState<File[]>([])
   const [name, setName] = useState('')
   const [dragOver, setDragOver] = useState(false)
@@ -61,6 +70,10 @@ export function DocumentsForm({ onStarted, workspaceId }: DocumentsFormProps) {
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [pct, setPct] = useState<number | null>(null)
+
+  // FolderReview state
+  const [reviewFiles, setReviewFiles] = useState<File[] | null>(null)
+  const [reviewFolderName, setReviewFolderName] = useState<string>('')
 
   // Pending action state when clicking submit while server is offline
   const [pending, setPending] = useState(false)
@@ -106,14 +119,21 @@ export function DocumentsForm({ onStarted, workspaceId }: DocumentsFormProps) {
 
   const handleFolderSelect = async (folderFiles: FileList | File[]) => {
     setError(null)
+    const arr = Array.from(folderFiles)
+    if (arr.length === 0) return
+    const firstRel = (arr[0] as any)?.webkitRelativePath || arr[0]?.name || ''
+    const folderName = firstRel.split('/')[0] || 'documents'
+    setReviewFolderName(folderName)
+    setReviewFiles(arr)
+  }
+
+  const handleConfirmReview = async (selectedFiles: File[]) => {
+    setReviewFiles(null)
     setPacking(true)
     setPackNote(null)
     try {
-      const arr = Array.from(folderFiles)
-      const firstRel = (arr[0] as any)?.webkitRelativePath || arr[0]?.name || ''
-      const folderName = firstRel.split('/')[0] || 'documents'
-
-      const res = await packFolder(arr, 'docs', folderName)
+      const folderName = reviewFolderName || 'documents'
+      const res = await packFolder(selectedFiles, 'docs', folderName)
       setFiles((prev) => [...prev, res.file])
       setPackNote(res.label)
       if (!name) {
@@ -204,6 +224,14 @@ export function DocumentsForm({ onStarted, workspaceId }: DocumentsFormProps) {
 
   return (
     <div className="space-y-4">
+      {/* Setup needed banner */}
+      {health?.setup_required && (
+        <div className="rounded-xl border border-amber/30 bg-amber/10 p-2.5 text-xs text-amber flex items-center gap-2">
+          <span className="h-2 w-2 rounded-full bg-amber animate-pulse shrink-0" />
+          <span className="font-medium">Setup needed: {health.setup_required}</span>
+        </div>
+      )}
+
       {/* Server Status Bar */}
       <ServerStatusBar
         expanded={helpExpanded}
@@ -212,91 +240,105 @@ export function DocumentsForm({ onStarted, workspaceId }: DocumentsFormProps) {
         onCancelPending={() => setPending(false)}
       />
 
-      {/* Dropzone */}
-      <div
-        onDragOver={(e) => {
-          e.preventDefault()
-          setDragOver(true)
-        }}
-        onDragLeave={() => setDragOver(false)}
-        onDrop={handleDrop}
-        className={`relative flex flex-col items-center justify-center rounded-2xl border-2 border-dashed p-6 text-center transition-all ${
-          dragOver
-            ? 'border-amber bg-amber/10'
-            : 'border-white/10 bg-white/[0.02] hover:border-white/20 hover:bg-white/[0.03]'
-        }`}
-      >
-        <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-amber/10 text-amber mb-3">
-          <BookOpen size={24} />
-        </div>
-
-        <p className="text-sm font-medium text-ink">
-          Drop PDFs, Word files, notes or zipped folders of documents
-        </p>
-        <p className="mt-1 text-xs text-mist max-w-[40ch]">
-          Accepts .pdf, .docx, .doc, .md, .txt, .html, .zip, .tar.gz and folders
-        </p>
-
-        <div className="mt-4 flex flex-wrap items-center justify-center gap-2.5">
-          <button
-            type="button"
-            className="btn btn-ghost btn-sm flex items-center gap-1.5 !h-8 !px-3"
-            onClick={() => fileInputRef.current?.click()}
-          >
-            <FileUp size={15} className="text-amber" />
-            <span>Choose files</span>
-          </button>
-
-          <button
-            type="button"
-            className="btn btn-ghost btn-sm flex items-center gap-1.5 !h-8 !px-3"
-            onClick={() => folderInputRef.current?.click()}
-            disabled={packing}
-          >
-            {packing ? (
-              <Loader2 size={15} className="animate-spin text-amber" />
-            ) : (
-              <FolderUp size={15} className="text-amber" />
-            )}
-            <span>{packing ? 'Packing folder…' : 'Choose a folder'}</span>
-          </button>
-
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            hidden
-            accept=".pdf,.docx,.doc,.md,.txt,.html,.zip,.tar.gz"
-            onChange={(e) => {
-              if (e.target.files && e.target.files.length > 0) {
-                addIndividualFiles(e.target.files)
-              }
-              e.target.value = ''
-            }}
-          />
-
-          <input
-            ref={folderInputRef}
-            type="file"
-            multiple
-            hidden
-            {...({ webkitdirectory: '', directory: '' } as any)}
-            onChange={(e) => {
-              if (e.target.files && e.target.files.length > 0) {
-                void handleFolderSelect(e.target.files)
-              }
-              e.target.value = ''
-            }}
-          />
-        </div>
-
-        {packNote && (
-          <div className="mt-3 inline-flex items-center gap-1.5 rounded-full border border-amber/30 bg-amber/10 px-3 py-1 text-xs text-amber font-medium">
-            <Archive size={13} />
-            <span>{packNote}</span>
+      {/* Folder Review or Dropzone */}
+      {reviewFiles ? (
+        <FolderReview
+          files={reviewFiles}
+          mode="docs"
+          folderName={reviewFolderName}
+          onConfirm={handleConfirmReview}
+          onChangeFolder={() => {
+            setReviewFiles(null)
+            setTimeout(() => folderInputRef.current?.click(), 0)
+          }}
+          disabled={Boolean(health?.setup_required)}
+        />
+      ) : (
+        <div
+          onDragOver={(e) => {
+            e.preventDefault()
+            setDragOver(true)
+          }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={handleDrop}
+          className={`relative flex flex-col items-center justify-center rounded-2xl border-2 border-dashed p-6 text-center transition-all ${
+            dragOver
+              ? 'border-amber bg-amber/10'
+              : 'border-white/10 bg-white/[0.02] hover:border-white/20 hover:bg-white/[0.03]'
+          }`}
+        >
+          <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-amber/10 text-amber mb-3">
+            <BookOpen size={24} />
           </div>
-        )}
-      </div>
+
+          <p className="text-sm font-medium text-ink">
+            Drop PDFs, Word files, notes or zipped folders of documents
+          </p>
+          <p className="mt-1 text-xs text-mist max-w-[40ch]">
+            Accepts .pdf, .docx, .doc, .md, .txt, .html, .zip, .tar.gz and folders
+          </p>
+
+          <div className="mt-4 flex flex-wrap items-center justify-center gap-2.5">
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm flex items-center gap-1.5 !h-8 !px-3"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <FileUp size={15} className="text-amber" />
+              <span>Choose files</span>
+            </button>
+
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm flex items-center gap-1.5 !h-8 !px-3"
+              onClick={() => folderInputRef.current?.click()}
+              disabled={packing}
+            >
+              {packing ? (
+                <Loader2 size={15} className="animate-spin text-amber" />
+              ) : (
+                <FolderUp size={15} className="text-amber" />
+              )}
+              <span>{packing ? 'Packing folder…' : 'Choose a folder'}</span>
+            </button>
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              hidden
+              accept=".pdf,.docx,.doc,.md,.txt,.html,.zip,.tar.gz"
+              onChange={(e) => {
+                if (e.target.files && e.target.files.length > 0) {
+                  addIndividualFiles(e.target.files)
+                }
+                e.target.value = ''
+              }}
+            />
+
+            <input
+              ref={folderInputRef}
+              type="file"
+              multiple
+              hidden
+              {...({ webkitdirectory: '', directory: '' } as any)}
+              onChange={(e) => {
+                if (e.target.files && e.target.files.length > 0) {
+                  void handleFolderSelect(e.target.files)
+                }
+                e.target.value = ''
+              }}
+            />
+          </div>
+
+          {packNote && (
+            <div className="mt-3 inline-flex items-center gap-1.5 rounded-full border border-amber/30 bg-amber/10 px-3 py-1 text-xs text-amber font-medium">
+              <Archive size={13} />
+              <span>{packNote}</span>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Warnings */}
       {warnings.length > 0 && (
@@ -395,7 +437,7 @@ export function DocumentsForm({ onStarted, workspaceId }: DocumentsFormProps) {
         <button
           type="button"
           className="btn btn-primary w-full !h-11 text-sm font-semibold"
-          disabled={files.length === 0 || busy || packing || pending}
+          disabled={files.length === 0 || busy || packing || pending || Boolean(health?.setup_required)}
           onClick={handleSubmit}
         >
           {busy ? (

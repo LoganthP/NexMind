@@ -1,6 +1,5 @@
-import { zipSync } from 'fflate'
-import { api, getApiBase, authHeaders, ApiError } from './api'
-import { EXCLUDED_FOLDERS, shouldIncludeFile } from './folderUpload'
+import { api, getApiBase, authHeaders, ApiError, uploadChunkedFile } from './api'
+import { EXCLUDED_FOLDERS, shouldIncludeFile, packWithWorker } from './folderUpload'
 
 export interface FileEntryRecord {
   file: File
@@ -22,6 +21,7 @@ export interface SyncState {
   pathHint: string
   workspaceId: string | null
   lastSyncTime: number | null
+  fileCount?: number
   status: 'idle' | 'syncing' | 'permission-needed' | 'uploading' | 'error'
   errorMessage?: string
   dirHandle: any | null
@@ -113,77 +113,27 @@ export async function computeHandleSignature(dirHandle: any): Promise<HandleWalk
 
 export async function packDirectoryFiles(
   files: FileEntryRecord[],
-  folderName: string
-): Promise<File> {
+  folderName: string,
+  manifest?: Record<string, string>
+): Promise<{ zipFile: File | null; changedCount: number; deleted: string[] }> {
   if (files.length === 0) {
     throw new Error('This folder has no source files we can analyze')
   }
 
-  const totalBytes = files.reduce((acc, f) => acc + f.file.size, 0)
-  if (totalBytes > 120 * 1024 * 1024) {
-    throw new Error('Folder is larger than 120 MB after skipping dependencies; choose a sub-folder such as src')
+  const rawFiles = files.map((f) => f.file)
+  const res = await packWithWorker(rawFiles, { folderName, manifest })
+  return {
+    zipFile: res.zipFile,
+    changedCount: res.changedCount,
+    deleted: res.deleted,
   }
-
-  const zippable: Record<string, Uint8Array> = {}
-  for (const item of files) {
-    const buf = await item.file.arrayBuffer()
-    zippable[item.relativePath] = new Uint8Array(buf)
-  }
-  const zipBytes = zipSync(zippable)
-  return new File([zipBytes], `${folderName}.zip`, { type: 'application/zip' })
 }
 
 export async function uploadArchiveChunked(
   file: File,
   onProgress?: (pct: number) => void
 ): Promise<string> {
-  const name = file.name.slice(0, 300)
-  const initRes = await fetch(`${getApiBase()}/api/uploads`, {
-    method: 'POST',
-    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, size: file.size }),
-  })
-  if (!initRes.ok) {
-    let detail = `Upload initialization failed (${initRes.status})`
-    try {
-      const d = await initRes.json()
-      if (typeof d.detail === 'string') detail = d.detail
-    } catch {}
-    throw new ApiError(detail, initRes.status)
-  }
-  const init = (await initRes.json()) as { upload_id: string; chunk_size: number; chunks: number }
-
-  for (let i = 0; i < init.chunks; i++) {
-    const part = file.slice(i * init.chunk_size, (i + 1) * init.chunk_size)
-    let attempt = 0
-    for (;;) {
-      try {
-        const res = await fetch(`${getApiBase()}/api/uploads/${init.upload_id}/chunks/${i}`, {
-          method: 'PUT',
-          headers: { ...authHeaders(), 'Content-Type': 'application/octet-stream' },
-          body: part,
-        })
-        if (!res.ok) {
-          let detail = `Upload failed (${res.status})`
-          try {
-            const d = await res.json()
-            if (typeof d.detail === 'string') detail = d.detail
-          } catch {}
-          throw new ApiError(detail, res.status)
-        }
-        break
-      } catch (e) {
-        attempt += 1
-        if (attempt >= 3 || (e instanceof ApiError && e.status >= 400 && e.status < 500)) {
-          throw e instanceof ApiError ? e : new ApiError('Cannot reach the NexMind server. Is it running?')
-        }
-        await new Promise((r) => setTimeout(r, 600 * attempt))
-      }
-    }
-    onProgress?.(Math.min(99, Math.round(((i + 1) / init.chunks) * 100)))
-  }
-  onProgress?.(100)
-  return init.upload_id
+  return uploadChunkedFile(file, file.name, (pct) => onProgress?.(pct))
 }
 
 class BrowserFolderSyncManager {
@@ -233,7 +183,8 @@ class BrowserFolderSyncManager {
     folderName: string,
     pathHint: string,
     workspaceId: string,
-    initialSignature: string
+    initialSignature: string,
+    fileCount?: number
   ) {
     this.stopSync()
     this.state = {
@@ -242,6 +193,7 @@ class BrowserFolderSyncManager {
       pathHint,
       workspaceId,
       lastSyncTime: Date.now(),
+      fileCount,
       status: 'syncing',
       dirHandle: handle,
     }
@@ -344,15 +296,60 @@ class BrowserFolderSyncManager {
       this.state = { ...this.state, status: 'uploading' }
       this.notify()
 
-      const zipFile = await packDirectoryFiles(walk.files, this.state.folderName)
-      const uploadId = await uploadArchiveChunked(zipFile)
-      await api.connectUpload(uploadId, this.state.pathHint, this.state.folderName, true)
+      let manifestFiles: Record<string, string> | undefined
+      try {
+        const manifestRes = await api.sourcesManifest({
+          path_hint: this.state.pathHint,
+          workspace_id: this.state.workspaceId || undefined,
+        })
+        if (manifestRes && manifestRes.files) {
+          manifestFiles = manifestRes.files
+        }
+      } catch {
+        /* proceed with full upload if manifest not supported */
+      }
+
+      const { zipFile, changedCount, deleted } = await packDirectoryFiles(
+        walk.files,
+        this.state.folderName,
+        manifestFiles
+      )
+
+      if (manifestFiles && changedCount === 0 && deleted.length === 0) {
+        this.lastUploadedSignature = walk.signature
+        this.state = {
+          ...this.state,
+          status: 'syncing',
+          lastSyncTime: Date.now(),
+          fileCount: walk.count,
+          errorMessage: undefined,
+        }
+        return
+      }
+
+      let uploadId: string | null = null
+      if (zipFile && changedCount > 0) {
+        uploadId = await uploadArchiveChunked(zipFile)
+      }
+
+      if (manifestFiles) {
+        await api.connectDelta({
+          path_hint: this.state.pathHint,
+          upload_id: uploadId,
+          deleted,
+          name: this.state.folderName,
+          watch: true,
+        })
+      } else if (uploadId) {
+        await api.connectUpload(uploadId, this.state.pathHint, this.state.folderName, true)
+      }
 
       this.lastUploadedSignature = walk.signature
       this.state = {
         ...this.state,
         status: 'syncing',
         lastSyncTime: Date.now(),
+        fileCount: walk.count,
         errorMessage: undefined,
       }
     } catch (err: any) {

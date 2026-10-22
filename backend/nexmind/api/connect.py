@@ -38,6 +38,14 @@ class ConnectUploadIn(BaseModel):
     watch: bool = True
 
 
+class ConnectDeltaIn(BaseModel):
+    path_hint: str = Field(min_length=1, max_length=1000)
+    upload_id: str | None = None
+    deleted: list[str] = Field(default_factory=list)
+    name: str | None = Field(default=None, max_length=120)
+    watch: bool = True
+
+
 class WatchIn(BaseModel):
     enabled: bool = True
 
@@ -147,6 +155,49 @@ def connect_upload(body: ConnectUploadIn) -> dict:
         events.add(ws_id, "source_changed", job_id, source_id=sid)
     _record_session(ws_id, name, hint, job_id, reused)
     return _out(ws_id, job_id, name, reused)
+
+
+@router.post("/connect/delta")
+def connect_delta(body: ConnectDeltaIn) -> dict:
+    """Incremental sync: upload only changed/new files and deleted paths."""
+    require_storage()
+    hint = body.path_hint.strip()
+    clause, params = _owner_clause()
+    existing = db.one(
+        "SELECT w.id, w.name, s.id AS sid FROM workspaces w JOIN sources s ON s.workspace_id=w.id "
+        "WHERE w.kind='live' AND s.origin=? AND s.stored=1" + clause + " LIMIT 1",
+        (hint, *params),
+    )
+    if not existing:
+        if not body.upload_id:
+            raise HTTPException(400, "No existing workspace found for this folder; initial upload is required.")
+        return connect_upload(ConnectUploadIn(upload_id=body.upload_id, path_hint=body.path_hint, name=body.name, watch=body.watch))
+
+    ws_id, sid, name = existing["id"], existing["sid"], existing["name"]
+    added_root: Path | None = None
+    if body.upload_id:
+        stage = _tmpdir("nexmind-cd-")
+        out = _tmpdir("nexmind-cdx-")
+        try:
+            _, archive = assemble_upload(body.upload_id, stage)
+            from ..ingest.files import collapse_single_root, safe_extract_zip
+            safe_extract_zip(archive, out)
+            added_root = collapse_single_root(out)
+            files.apply_delta(ws_id, sid, added_root, body.deleted)
+        except IngestError as e:
+            raise HTTPException(400, str(e)) from e
+        finally:
+            shutil.rmtree(out, ignore_errors=True)
+            shutil.rmtree(stage, ignore_errors=True)
+        discard_uploads([body.upload_id])
+    else:
+        files.apply_delta(ws_id, sid, None, body.deleted)
+
+    db.execute("UPDATE sources SET watch=? WHERE id=?", (1 if body.watch else 0, sid))
+    job_id = jobs.submit(ws_id, "rebuild")
+    events.add(ws_id, "source_changed", job_id, source_id=sid)
+    _record_session(ws_id, name, hint, job_id, reused=True)
+    return _out(ws_id, job_id, name, reused=True)
 
 
 @router.get("/connect/sessions")

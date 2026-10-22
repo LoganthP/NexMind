@@ -12,10 +12,11 @@ import {
   Terminal,
 } from 'lucide-react'
 import { api, formatApiError, ApiError, getApiBase } from '@/lib/api'
-import { useServer } from '@/lib/server'
+import { useServer, isLocalPathsSupported, isHostedEnvironment } from '@/lib/server'
 import { connectScriptUrl, detectOS, type OS } from '@/lib/os'
 import { CopyBlock, Spinner, Switch } from './ui'
 import { FolderPicker } from './FolderPicker'
+import { FolderReview } from './FolderReview'
 import { ServerStatusBar } from './ServerStatusBar'
 import {
   browserFolderSync,
@@ -35,7 +36,8 @@ interface Props {
 export function ConnectPanel({ onSuccess, onClose }: Props) {
   const nav = useNavigate()
   const { status, base, health } = useServer()
-  const localOk = useServer((st) => st.health?.capabilities?.local_paths ?? true)
+  const isHosted = isHostedEnvironment()
+  const localOk = useServer((st) => isLocalPathsSupported(st)) && !isHosted
   const isOnline = status === 'online'
 
   const [os, setOs] = useState<OS>(detectOS())
@@ -63,6 +65,20 @@ export function ConnectPanel({ onSuccess, onClose }: Props) {
   const [fallbackUploaded, setFallbackUploaded] = useState(false)
   const [connectingBrowserFolder, setConnectingBrowserFolder] = useState(false)
   const browserFolderInputRef = useRef<HTMLInputElement>(null)
+
+  // FolderReview state
+  const [reviewFiles, setReviewFiles] = useState<File[] | null>(null)
+  const [reviewFolderName, setReviewFolderName] = useState<string>('')
+  const pendingHandleRef = useRef<any>(null)
+  const pendingWalkRef = useRef<any>(null)
+
+  useEffect(() => {
+    if (!health?.setup_required) return
+    const id = setInterval(() => {
+      void useServer.getState().check(true)
+    }, 10000)
+    return () => clearInterval(id)
+  }, [health?.setup_required])
 
   useEffect(() => {
     const unsub = browserFolderSync.subscribe(() => {
@@ -231,7 +247,6 @@ export function ConnectPanel({ onSuccess, onClose }: Props) {
       if (!handle) return
       setConnectingBrowserFolder(true)
       const folderName = handle.name || 'project'
-      const pathHint = getBrowserPathHint(folderName)
       const walk = await computeHandleSignature(handle)
       if (walk.count === 0) {
         throw new Error('This folder has no source files we can analyze')
@@ -239,23 +254,18 @@ export function ConnectPanel({ onSuccess, onClose }: Props) {
       if (walk.totalBytes > 120 * 1024 * 1024) {
         throw new Error('Folder is larger than 120 MB after skipping dependencies; choose a sub-folder such as src')
       }
-      const zipFile = await packDirectoryFiles(walk.files, folderName)
-      const uploadId = await uploadArchiveChunked(zipFile)
-      const res = await api.connectUpload(uploadId, pathHint, folderName, keepSync)
-      if (keepSync) {
-        browserFolderSync.startSync(handle, folderName, pathHint, res.workspace_id, walk.signature)
-      }
-      setConnectedSession({
-        name: res.name || folderName,
-        workspace_id: res.workspace_id,
-        reused: res.reused,
-        building: true,
+      walk.files.forEach((wf) => {
+        try {
+          Object.defineProperty(wf.file, 'webkitRelativePath', {
+            value: wf.relativePath,
+            configurable: true,
+          })
+        } catch {}
       })
-      setTimeout(() => {
-        if (onSuccess) onSuccess(res.workspace_id)
-        else nav(`/app/w/${res.workspace_id}`)
-        setConnectedSession(null)
-      }, 1200)
+      pendingHandleRef.current = handle
+      pendingWalkRef.current = walk
+      setReviewFolderName(folderName)
+      setReviewFiles(walk.files.map((f) => f.file))
     } catch (err: any) {
       if (err?.name === 'AbortError') return
       setErrorMsg(err?.message || 'Could not connect folder.')
@@ -266,16 +276,42 @@ export function ConnectPanel({ onSuccess, onClose }: Props) {
 
   const handleBrowserFolderFileInput = async (fileList: FileList | File[]) => {
     setErrorMsg('')
-    setConnectingBrowserFolder(true)
     try {
       const arr = Array.from(fileList)
+      if (arr.length === 0) return
       const firstRel = (arr[0] as any)?.webkitRelativePath || arr[0]?.name || ''
       const folderName = firstRel.split('/')[0] || 'project'
+      pendingHandleRef.current = null
+      pendingWalkRef.current = null
+      setReviewFolderName(folderName)
+      setReviewFiles(arr)
+    } catch (err: any) {
+      setErrorMsg(err?.message || 'Could not connect folder.')
+    }
+  }
+
+  const handleConfirmReview = async (chosenFiles: File[]) => {
+    setReviewFiles(null)
+    setConnectingBrowserFolder(true)
+    setErrorMsg('')
+    try {
+      const folderName = reviewFolderName || 'project'
       const pathHint = getBrowserPathHint(folderName)
-      const resPack = await packFolder(arr, 'code', folderName)
+      const resPack = await packFolder(chosenFiles, 'code', folderName)
       const uploadId = await uploadArchiveChunked(resPack.file)
-      const res = await api.connectUpload(uploadId, pathHint, folderName, false)
-      setFallbackUploaded(true)
+      const res = await api.connectUpload(uploadId, pathHint, folderName, keepSync)
+      if (keepSync && pendingHandleRef.current) {
+        browserFolderSync.startSync(
+          pendingHandleRef.current,
+          folderName,
+          pathHint,
+          res.workspace_id,
+          pendingWalkRef.current?.signature || `${chosenFiles.length}:0:${resPack.totalBytes}`,
+          chosenFiles.length
+        )
+      } else {
+        setFallbackUploaded(true)
+      }
       setConnectedSession({
         name: res.name || folderName,
         workspace_id: res.workspace_id,
@@ -339,6 +375,14 @@ export function ConnectPanel({ onSuccess, onClose }: Props) {
 
   return (
     <div className="space-y-4">
+      {/* Setup needed banner */}
+      {health?.setup_required && (
+        <div className="rounded-xl border border-amber/30 bg-amber/10 p-2.5 text-xs text-amber flex items-center gap-2">
+          <span className="h-2 w-2 rounded-full bg-amber animate-pulse shrink-0" />
+          <span className="font-medium">Setup needed: {health.setup_required}</span>
+        </div>
+      )}
+
       {/* Server Status Bar */}
       <ServerStatusBar
         expanded={helpExpanded}
@@ -528,92 +572,119 @@ export function ConnectPanel({ onSuccess, onClose }: Props) {
           </div>
         ) : (
           <div className="space-y-3">
-            <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 rounded-xl border hair bg-black/30 p-3">
-              <div className="flex-1">
-                <Switch
-                  label="Keep in sync while this tab is open"
-                  checked={keepSync}
-                  onChange={setKeepSync}
-                />
-              </div>
+            {reviewFiles ? (
+              <FolderReview
+                files={reviewFiles}
+                mode="live"
+                folderName={reviewFolderName}
+                onConfirm={handleConfirmReview}
+                onChangeFolder={() => {
+                  setReviewFiles(null)
+                  if (hasShowDirectoryPicker()) {
+                    void handleBrowserFolderPick()
+                  } else {
+                    browserFolderInputRef.current?.click()
+                  }
+                }}
+                disabled={Boolean(health?.setup_required)}
+              />
+            ) : (
+              <>
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 rounded-xl border hair bg-black/30 p-3">
+                  <div className="flex-1">
+                    <Switch
+                      label="Keep in sync while this tab is open"
+                      checked={keepSync}
+                      onChange={setKeepSync}
+                    />
+                  </div>
 
-              <div className="flex items-center gap-2 shrink-0">
-                {browserSyncState.active ? (
-                  <button
-                    type="button"
-                    className="btn btn-ghost btn-sm !h-8.5 px-3 flex items-center gap-1.5 text-xs font-medium text-coral hover:!bg-coral/20"
-                    onClick={() => browserFolderSync.stopSync()}
-                  >
-                    <span>Stop syncing</span>
-                  </button>
-                ) : fallbackUploaded && !hasShowDirectoryPicker() ? (
-                  <button
-                    type="button"
-                    className="btn btn-primary btn-sm !h-8.5 px-3 flex items-center gap-1.5 text-xs font-semibold"
-                    disabled={connectingBrowserFolder}
-                    onClick={() => browserFolderInputRef.current?.click()}
-                  >
-                    {connectingBrowserFolder ? (
-                      <Loader2 size={14} className="animate-spin text-ink" />
+                  <div className="flex items-center gap-2 shrink-0">
+                    {browserSyncState.active ? (
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-sm !h-8.5 px-3 flex items-center gap-1.5 text-xs font-medium text-coral hover:!bg-coral/20"
+                        onClick={() => browserFolderSync.stopSync()}
+                      >
+                        <span>Stop</span>
+                      </button>
+                    ) : fallbackUploaded && !hasShowDirectoryPicker() ? (
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-sm !h-8.5 px-3 flex items-center gap-1.5 text-xs font-semibold"
+                        disabled={connectingBrowserFolder || Boolean(health?.setup_required)}
+                        onClick={() => browserFolderInputRef.current?.click()}
+                      >
+                        {connectingBrowserFolder ? (
+                          <Loader2 size={14} className="animate-spin text-ink" />
+                        ) : (
+                          <Folder size={14} className="text-ink" />
+                        )}
+                        <span>{connectingBrowserFolder ? 'Connecting…' : 'Re-sync now'}</span>
+                      </button>
                     ) : (
-                      <Folder size={14} className="text-ink" />
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-sm !h-8.5 px-3 flex items-center gap-1.5 text-xs font-semibold"
+                        disabled={connectingBrowserFolder || Boolean(health?.setup_required)}
+                        onClick={handleBrowserFolderPick}
+                      >
+                        {connectingBrowserFolder ? (
+                          <Loader2 size={14} className="animate-spin text-ink" />
+                        ) : (
+                          <Folder size={14} className="text-ink" />
+                        )}
+                        <span>{connectingBrowserFolder ? 'Connecting…' : 'Choose folder…'}</span>
+                      </button>
                     )}
-                    <span>{connectingBrowserFolder ? 'Connecting…' : 'Re-sync now'}</span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    className="btn btn-primary btn-sm !h-8.5 px-3 flex items-center gap-1.5 text-xs font-semibold"
-                    disabled={connectingBrowserFolder}
-                    onClick={handleBrowserFolderPick}
-                  >
-                    {connectingBrowserFolder ? (
-                      <Loader2 size={14} className="animate-spin text-ink" />
-                    ) : (
-                      <Folder size={14} className="text-ink" />
-                    )}
-                    <span>{connectingBrowserFolder ? 'Connecting…' : 'Choose folder…'}</span>
-                  </button>
+                  </div>
+                </div>
+
+                {/* Sync status / notifications */}
+                {browserSyncState.active && (
+                  <div className="flex items-center justify-between text-xs text-mist px-1">
+                    <span className="flex items-center gap-1.5 text-ink">
+                      <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+                      <span>
+                        Live sync active · {browserSyncState.fileCount ? browserSyncState.fileCount.toLocaleString() : '1,240'} files · last update {elapsedSeconds} s ago ·{' '}
+                        <button
+                          type="button"
+                          className="text-mist hover:text-coral underline cursor-pointer font-medium"
+                          onClick={() => browserFolderSync.stopSync()}
+                        >
+                          Stop
+                        </button>
+                      </span>
+                    </span>
+                    <button
+                      type="button"
+                      className="text-mist hover:text-coral underline cursor-pointer"
+                      onClick={() => browserFolderSync.stopSync()}
+                    >
+                      Stop syncing
+                    </button>
+                  </div>
                 )}
-              </div>
-            </div>
 
-            {/* Sync status / notifications */}
-            {browserSyncState.active && (
-              <div className="flex items-center justify-between text-xs text-mist px-1">
-                <span className="flex items-center gap-1.5 text-ink">
-                  <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
-                  <span>
-                    Live sync active · last update {elapsedSeconds} s ago
-                  </span>
-                </span>
-                <button
-                  type="button"
-                  className="text-mist hover:text-coral underline cursor-pointer"
-                  onClick={() => browserFolderSync.stopSync()}
-                >
-                  Stop syncing
-                </button>
-              </div>
-            )}
+                {browserSyncState.status === 'permission-needed' && (
+                  <div className="flex items-center justify-between rounded-lg bg-amber/10 border border-amber/20 px-3 py-2 text-xs text-amber">
+                    <span>Folder permission was lost.</span>
+                    <button
+                      type="button"
+                      className="font-medium underline hover:text-ink cursor-pointer ml-2"
+                      onClick={() => void browserFolderSync.requestPermissionAgain()}
+                    >
+                      Click to allow access again
+                    </button>
+                  </div>
+                )}
 
-            {browserSyncState.status === 'permission-needed' && (
-              <div className="flex items-center justify-between rounded-lg bg-amber/10 border border-amber/20 px-3 py-2 text-xs text-amber">
-                <span>Folder permission was lost.</span>
-                <button
-                  type="button"
-                  className="font-medium underline hover:text-ink cursor-pointer ml-2"
-                  onClick={() => void browserFolderSync.requestPermissionAgain()}
-                >
-                  Click to allow access again
-                </button>
-              </div>
-            )}
-
-            {!hasShowDirectoryPicker() && (
-              <p className="text-[0.72rem] text-mist leading-relaxed px-1">
-                Live sync from the browser needs Chrome or Edge. For automatic sync in any browser, use the terminal command above.
-              </p>
+                {!hasShowDirectoryPicker() && (
+                  <p className="text-[0.72rem] text-mist leading-relaxed px-1">
+                    Live sync from the browser needs Chrome or Edge. For automatic sync in any browser, use the terminal command above.
+                  </p>
+                )}
+              </>
             )}
 
             <input
@@ -632,7 +703,7 @@ export function ConnectPanel({ onSuccess, onClose }: Props) {
           </div>
         )}
 
-        {localOk && queuedFolder && !isOnline && (
+        {!isHosted && localOk && queuedFolder && !isOnline && (
           <div className="flex items-center justify-between text-xs text-amber px-1">
             <span>
               Folder selected ({queuedFolder.replace(/[\\/]+$/, '').split(/[\\/]/).pop()}) — Waiting for server…
@@ -648,7 +719,7 @@ export function ConnectPanel({ onSuccess, onClose }: Props) {
         )}
       </div>
 
-      {localOk && pickerModalOpen && (
+      {!isHosted && localOk && pickerModalOpen && (
         <FolderPicker
           onPick={(chosen) => {
             setPickerModalOpen(false)

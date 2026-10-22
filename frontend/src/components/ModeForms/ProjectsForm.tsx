@@ -17,10 +17,11 @@ import {
   X,
 } from 'lucide-react'
 import { api, formatApiError, uploadFiles } from '@/lib/api'
-import { useServer } from '@/lib/server'
-import { packFolder, getFilesFromDataTransfer, type PackFolderResult } from '@/lib/folderUpload'
+import { useServer, isLocalPathsSupported } from '@/lib/server'
+import { packFolder, getFilesFromDataTransfer, packWithWorker, type PackFolderResult } from '@/lib/folderUpload'
 import type { FsCheckResult } from '@/lib/types'
 import { FolderPicker } from '../FolderPicker'
+import { FolderReview } from '../FolderReview'
 import { ServerStatusBar } from '../ServerStatusBar'
 
 interface ProjectsFormProps {
@@ -78,10 +79,18 @@ function formatBytes(bytes: number): string {
 }
 
 export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
-  const { status } = useServer()
+  const { status, health, check } = useServer()
   // A hosted NexMind (e.g. Vercel) cannot open folders on your computer: upload the folder instead.
-  const localOk = useServer((st) => st.health?.capabilities?.local_paths ?? true)
+  const localOk = useServer((st) => isLocalPathsSupported(st))
   const isOnline = status === 'online'
+
+  useEffect(() => {
+    if (!health?.setup_required) return
+    const id = setInterval(() => {
+      void check(true)
+    }, 10000)
+    return () => clearInterval(id)
+  }, [health?.setup_required, check])
 
   const [tab, setTab] = useState<Tab>('github')
   const [url, setUrl] = useState('')
@@ -90,6 +99,17 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
   const [path, setPath] = useState('')
   const [name, setName] = useState('')
   const [files, setFiles] = useState<File[]>([])
+
+  // FolderReview state
+  const [reviewFiles, setReviewFiles] = useState<File[] | null>(null)
+  const [reviewFolderName, setReviewFolderName] = useState<string>('')
+  const [reviewSourceTab, setReviewSourceTab] = useState<'local' | 'upload'>('local')
+
+  // Upload phase & progress
+  const [uploadPhase, setUploadPhase] = useState<'reading' | 'packing' | 'uploading' | 'building' | null>(null)
+  const [uploadProgressText, setUploadProgressText] = useState('')
+  const [uploadProgressPct, setUploadProgressPct] = useState(0)
+  const abortControllerRef = useRef<AbortController | null>(null)
 
   // Local folder checking
   const [checkInfo, setCheckInfo] = useState<FsCheckResult | null>(null)
@@ -203,50 +223,100 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
     }
   }
 
+  const handleConfirmReview = async (selectedFiles: File[]) => {
+    setError(null)
+    setBusy(true)
+    const ctl = new AbortController()
+    abortControllerRef.current = ctl
+    setUploadPhase('reading')
+    setUploadProgressText('Reading files…')
+    setUploadProgressPct(10)
+
+    try {
+      const folderName = reviewFolderName || 'project'
+      const packRes = await packWithWorker(selectedFiles, {
+        folderName,
+        onProgress: (_phase, text, pct) => {
+          setUploadPhase('packing')
+          setUploadProgressText(text)
+          setUploadProgressPct(pct)
+        },
+        signal: ctl.signal,
+      })
+
+      if (!packRes.zipFile) {
+        throw new Error('This folder has no source files we can analyze')
+      }
+
+      setUploadPhase('uploading')
+      setUploadProgressText('Uploading…')
+      setUploadProgressPct(60)
+
+      let wsId = workspaceId
+      const finalName = name.trim() || defaultName || folderName
+      if (!wsId) {
+        const created = await api.createWorkspace(finalName, '', 'code')
+        wsId = created.id
+      }
+
+      const job = await uploadFiles(
+        wsId,
+        [packRes.zipFile],
+        (pct, text) => {
+          setUploadProgressPct(60 + Math.round((pct / 100) * 35))
+          if (text) setUploadProgressText(text)
+        },
+        ctl.signal
+      )
+
+      setUploadPhase('building')
+      setUploadProgressText('Building graph…')
+      setUploadProgressPct(99)
+
+      setReviewFiles(null)
+      onStarted?.(job.job_id, wsId)
+    } catch (err: any) {
+      if (ctl.signal.aborted || err?.message === 'Packing cancelled' || err?.message === 'Upload cancelled') {
+        // aborted by user
+      } else {
+        setError(formatApiError(err))
+      }
+    } finally {
+      setBusy(false)
+      setUploadPhase(null)
+      abortControllerRef.current = null
+    }
+  }
+
+  const handleCancelUpload = () => {
+    abortControllerRef.current?.abort()
+    setUploadPhase(null)
+    setBusy(false)
+  }
+
   const handleFolderUpload = async (folderFiles: FileList | File[]) => {
     setError(null)
-    setPacking(true)
-    setPackNote(null)
-    try {
-      const arr = Array.from(folderFiles)
-      const firstRel = (arr[0] as any)?.webkitRelativePath || arr[0]?.name || ''
-      const folderName = firstRel.split('/')[0] || 'project'
-
-      const res = await packFolder(arr, 'code', folderName)
-      setFiles([res.file])
-      setPackNote(res.label)
-      if (!name) {
-        setName(folderName)
-      }
-    } catch (err: any) {
-      setError(err?.message || 'Could not pack project folder.')
-    } finally {
-      setPacking(false)
-    }
+    const arr = Array.from(folderFiles)
+    if (arr.length === 0) return
+    const firstRel = (arr[0] as any)?.webkitRelativePath || arr[0]?.name || ''
+    const folderName = firstRel.split('/')[0] || 'project'
+    setReviewFiles(arr)
+    setReviewFolderName(folderName)
+    setReviewSourceTab('upload')
+    if (!name) setName(folderName)
   }
 
   const handleHostedFolderPick = async (folderFiles: FileList | File[]) => {
     setError(null)
-    setPackingLocal(true)
-    try {
-      const arr = Array.from(folderFiles)
-      const firstRel = (arr[0] as any)?.webkitRelativePath || arr[0]?.name || ''
-      const folderName = firstRel.split('/')[0] || 'project'
-      setLocalFolderName(folderName)
-
-      const res = await packFolder(arr, 'code', folderName)
-      setPackedLocalFolder(res)
-      setFiles([res.file])
-      if (!name) {
-        setName(folderName)
-      }
-    } catch (err: any) {
-      setPackedLocalFolder(null)
-      setFiles([])
-      setError(err?.message || 'Could not pack project folder.')
-    } finally {
-      setPackingLocal(false)
-    }
+    const arr = Array.from(folderFiles)
+    if (arr.length === 0) return
+    const firstRel = (arr[0] as any)?.webkitRelativePath || arr[0]?.name || ''
+    const folderName = firstRel.split('/')[0] || 'project'
+    setLocalFolderName(folderName)
+    setReviewFiles(arr)
+    setReviewFolderName(folderName)
+    setReviewSourceTab('local')
+    if (!name) setName(folderName)
   }
 
   const handleDropArchive = (e: DragEvent<HTMLDivElement>) => {
@@ -330,6 +400,14 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
 
   return (
     <div className="space-y-4">
+      {/* Setup needed banner */}
+      {health?.setup_required && (
+        <div className="rounded-xl border border-amber/30 bg-amber/10 p-2.5 text-xs text-amber flex items-center gap-2">
+          <span className="h-2 w-2 rounded-full bg-amber animate-pulse shrink-0" />
+          <span className="font-medium">Setup needed: {health.setup_required}</span>
+        </div>
+      )}
+
       {/* Server Status Bar */}
       <ServerStatusBar
         expanded={helpExpanded}
@@ -425,11 +503,24 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
         {/* Upload project tab */}
         {tab === 'upload' && (
           <div className="space-y-3">
-            <div
-              onDragOver={(e) => {
-                e.preventDefault()
-                setDragOver(true)
-              }}
+            {reviewFiles && reviewSourceTab === 'upload' ? (
+              <FolderReview
+                files={reviewFiles}
+                mode="code"
+                folderName={reviewFolderName}
+                onConfirm={handleConfirmReview}
+                onChangeFolder={() => {
+                  setReviewFiles(null)
+                  setTimeout(() => folderInputRef.current?.click(), 0)
+                }}
+                disabled={Boolean(health?.setup_required)}
+              />
+            ) : (
+              <div
+                onDragOver={(e) => {
+                  e.preventDefault()
+                  setDragOver(true)
+                }}
               onDragLeave={() => setDragOver(false)}
               onDrop={handleDropArchive}
               className={`relative flex flex-col items-center justify-center rounded-2xl border-2 border-dashed p-6 text-center transition-all ${
@@ -508,8 +599,9 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
                 </div>
               )}
             </div>
+            )}
 
-            {files.length > 0 && (
+            {files.length > 0 && !reviewFiles && (
               <ul className="space-y-1.5 text-xs">
                 {files.map((f, i) => (
                   <li
@@ -615,7 +707,19 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
             </div>
           ) : (
             <div className="space-y-3">
-              {!packedLocalFolder ? (
+              {reviewFiles && reviewSourceTab === 'local' ? (
+                <FolderReview
+                  files={reviewFiles}
+                  mode="code"
+                  folderName={reviewFolderName}
+                  onConfirm={handleConfirmReview}
+                  onChangeFolder={() => {
+                    setReviewFiles(null)
+                    setTimeout(() => localFolderInputRef.current?.click(), 0)
+                  }}
+                  disabled={Boolean(health?.setup_required)}
+                />
+              ) : (
                 <div
                   onDragOver={(e) => {
                     e.preventDefault()
@@ -685,56 +789,34 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
                     />
                   </div>
                 </div>
-              ) : (
-                <div className="rounded-2xl border hair bg-black/20 p-4 space-y-3">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <FolderOpen size={18} className="text-plankton" />
-                      <span className="text-sm font-semibold text-ink">
-                        Packed {packedLocalFolder.fileCount} files · {(packedLocalFolder.totalBytes / (1024 * 1024)).toFixed(1)} MB from {localFolderName}
-                      </span>
-                    </div>
-                    <button
-                      type="button"
-                      className="text-xs text-mist hover:text-plankton underline cursor-pointer"
-                      onClick={() => {
-                        setPackedLocalFolder(null)
-                        setFiles([])
-                        setTimeout(() => localFolderInputRef.current?.click(), 0)
-                      }}
-                    >
-                      Change
-                    </button>
-                  </div>
-
-                  <input
-                    ref={localFolderInputRef}
-                    type="file"
-                    multiple
-                    hidden
-                    {...({ webkitdirectory: '', directory: '' } as any)}
-                    onChange={(e) => {
-                      if (e.target.files && e.target.files.length > 0) {
-                        void handleHostedFolderPick(e.target.files)
-                      }
-                      e.target.value = ''
-                    }}
-                  />
-
-                  {packedLocalFolder.skippedFolders && packedLocalFolder.skippedFolders.length > 0 && (
-                    <details className="text-xs text-mist">
-                      <summary className="cursor-pointer hover:text-ink transition-colors">
-                        Skipped ({packedLocalFolder.skippedFolders.length} folders)
-                      </summary>
-                      <div className="mt-1.5 p-2 rounded-lg bg-black/30 border hair font-mono text-[0.7rem] text-mist/80">
-                        {packedLocalFolder.skippedFolders.join(', ')}
-                      </div>
-                    </details>
-                  )}
-                </div>
               )}
             </div>
           )
+        )}
+
+        {/* Phase Progress Bar with Cancel Button */}
+        {uploadPhase && (
+          <div className="rounded-2xl border hair bg-black/25 p-4 space-y-3">
+            <div className="flex items-center justify-between text-xs">
+              <span className="font-semibold text-ink flex items-center gap-2">
+                <Loader2 size={13} className="animate-spin text-plankton" />
+                <span>{uploadProgressText}</span>
+              </span>
+              <button
+                type="button"
+                className="text-mist hover:text-coral underline text-xs cursor-pointer"
+                onClick={handleCancelUpload}
+              >
+                Cancel
+              </button>
+            </div>
+            <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+              <div
+                className="h-full bg-plankton transition-all duration-300 rounded-full"
+                style={{ width: `${Math.max(4, Math.min(100, uploadProgressPct))}%` }}
+              />
+            </div>
+          </div>
         )}
 
         {/* Workspace Name */}
@@ -766,49 +848,51 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
           </div>
         )}
 
-        {/* Submit Button & Pending state */}
-        <div className="space-y-2 pt-1">
-          <button
-            type="button"
-            className="btn btn-primary w-full !h-11 text-sm font-semibold"
-            disabled={!isReady || busy || packing || pending}
-            onClick={handleSubmit}
-          >
-            {busy ? (
-              <>
-                <Loader2 className="animate-spin" size={17} />
-                <span>{pct !== null ? `Uploading ${pct}%` : 'Analyzing project…'}</span>
-              </>
-            ) : pending ? (
-              <>
-                <Loader2 className="animate-spin" size={17} />
-                <span>Waiting for server…</span>
-              </>
-            ) : (
-              <>
-                <Sparkles size={17} />
-                <span>Analyze project</span>
-              </>
-            )}
-          </button>
+        {/* Submit Button & Pending state - only show when not reviewing files */}
+        {!reviewFiles && (
+          <div className="space-y-2 pt-1">
+            <button
+              type="button"
+              className="btn btn-primary w-full !h-11 text-sm font-semibold"
+              disabled={!isReady || busy || packing || pending || Boolean(health?.setup_required)}
+              onClick={handleSubmit}
+            >
+              {busy ? (
+                <>
+                  <Loader2 className="animate-spin" size={17} />
+                  <span>{pct !== null ? `Uploading ${pct}%` : 'Analyzing project…'}</span>
+                </>
+              ) : pending ? (
+                <>
+                  <Loader2 className="animate-spin" size={17} />
+                  <span>Waiting for server…</span>
+                </>
+              ) : (
+                <>
+                  <Sparkles size={17} />
+                  <span>Analyze project</span>
+                </>
+              )}
+            </button>
 
-          {pending && (
-            <div className="flex items-center justify-between text-xs text-amber px-1">
-              <span>We&apos;ll start as soon as the server connects.</span>
-              <button
-                type="button"
-                className="underline hover:text-ink transition-colors"
-                onClick={() => setPending(false)}
-              >
-                Cancel
-              </button>
-            </div>
-          )}
-        </div>
+            {pending && (
+              <div className="flex items-center justify-between text-xs text-amber px-1">
+                <span>We&apos;ll start as soon as the server connects.</span>
+                <button
+                  type="button"
+                  className="underline hover:text-ink transition-colors"
+                  onClick={() => setPending(false)}
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* In-app FolderPicker modal */}
-      {pickerModalOpen && (
+      {localOk && pickerModalOpen && (
         <FolderPicker
           initialPath={path || undefined}
           onClose={() => setPickerModalOpen(false)}

@@ -19,6 +19,7 @@ export interface ServerState {
   lastCheckedAt: number | null
   blockedOrigin: string | null
   health: Health | null
+  localPaths: boolean
   attempts: number
   check: (timeoutMsOrGesture?: number | boolean, isUserGesture?: boolean) => Promise<boolean>
   useBase: (url: string) => Promise<boolean>
@@ -29,6 +30,76 @@ export interface ProbeResult {
   base: string
   health?: Health | null
   origin?: string | null
+}
+
+const LAST_HEALTH_KEY = 'nexmind.lastHealth'
+
+export function getCachedHealth(): Health | null {
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      const raw = sessionStorage.getItem(LAST_HEALTH_KEY)
+      if (raw) return JSON.parse(raw)
+    }
+  } catch {}
+  return null
+}
+
+export function setCachedHealth(h: Health | null): void {
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      if (h) sessionStorage.setItem(LAST_HEALTH_KEY, JSON.stringify(h))
+      else sessionStorage.removeItem(LAST_HEALTH_KEY)
+    }
+  } catch {}
+}
+
+export function isHostedEnvironment(): boolean {
+  if (typeof window === 'undefined' || !window.location) return false
+  const same = sameOriginBase()
+  if (!same) return false
+  try {
+    const u = new URL(same, window.location.href)
+    const host = u.hostname.toLowerCase()
+    const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '::1'
+    return window.location.protocol === 'https:' && !isLocal
+  } catch {
+    return false
+  }
+}
+
+export function isLocalPathsSupported(st?: ServerState | null): boolean {
+  if (isHostedEnvironment()) return false
+  const s = st || (typeof useServer !== 'undefined' ? useServer.getState() : null)
+  const h = s?.health || getCachedHealth()
+  if (h?.capabilities?.local_paths !== undefined) {
+    return Boolean(h.capabilities.local_paths)
+  }
+  return true
+}
+
+let activeOperations = 0
+
+export function beginActivity(): () => void {
+  activeOperations++
+  return () => {
+    endActivity()
+  }
+}
+
+export function endActivity(): void {
+  activeOperations = Math.max(0, activeOperations - 1)
+}
+
+export function isActivityInProgress(): boolean {
+  return activeOperations > 0
+}
+
+let consecutiveFailures = 0
+let firstFailureTime: number | null = null
+
+export function resetFailureTracking(): void {
+  consecutiveFailures = 0
+  firstFailureTime = null
 }
 
 type JustConnectedListener = (detail: { base: string; health: Health }) => void
@@ -219,138 +290,177 @@ export async function probeCandidate(
 let inFlight: Promise<boolean> | null = null
 let isFirstProbe = true
 
-export const useServer = create<ServerState>((set, get) => ({
-  state: 'not-running',
-  status: 'checking',
-  connected: false,
-  base: getApiBase(),
-  failingAddress: null,
-  lastCheckedAt: null,
-  blockedOrigin: null,
-  health: null,
-  attempts: 0,
-  check: async (timeoutMsOrGesture?: number | boolean, isUserGesture?: boolean) => {
-    let probeTimeout = 2500
-    let userGesture = false
+export const useServer = create<ServerState>((set, get) => {
+  const initialHealth = getCachedHealth()
+  return {
+    state: 'not-running',
+    status: 'checking',
+    connected: false,
+    base: getApiBase(),
+    failingAddress: null,
+    lastCheckedAt: null,
+    blockedOrigin: null,
+    health: initialHealth,
+    localPaths: isHostedEnvironment() ? false : (initialHealth?.capabilities?.local_paths ?? true),
+    attempts: 0,
+    check: async (timeoutMsOrGesture?: number | boolean, isUserGesture?: boolean) => {
+      const defaultTimeout = isHostedEnvironment() ? 5000 : (isFirstProbe ? 1200 : 2500)
+      let probeTimeout = defaultTimeout
+      let userGesture = false
 
-    if (typeof timeoutMsOrGesture === 'boolean') {
-      userGesture = timeoutMsOrGesture
-      probeTimeout = isFirstProbe ? 1200 : 2500
-    } else if (typeof timeoutMsOrGesture === 'number') {
-      probeTimeout = timeoutMsOrGesture
-      userGesture = Boolean(isUserGesture)
-    } else {
-      probeTimeout = isFirstProbe ? 1200 : 2500
-      userGesture = Boolean(isUserGesture)
-    }
-    isFirstProbe = false
+      if (typeof timeoutMsOrGesture === 'boolean') {
+        userGesture = timeoutMsOrGesture
+        probeTimeout = defaultTimeout
+      } else if (typeof timeoutMsOrGesture === 'number') {
+        probeTimeout = timeoutMsOrGesture
+        userGesture = Boolean(isUserGesture)
+      } else {
+        probeTimeout = defaultTimeout
+        userGesture = Boolean(isUserGesture)
+      }
+      isFirstProbe = false
 
-    if (inFlight && !userGesture) return inFlight
+      if (isActivityInProgress() && !userGesture) {
+        return true
+      }
 
-    const run = async (): Promise<boolean> => {
-      try {
-        const wasOnline = get().status === 'online'
-        const candidates = getProbeCandidates()
-        const failures: ProbeResult[] = []
+      if (inFlight && !userGesture) return inFlight
 
-        for (const base of candidates) {
-          const res = await probeCandidate(base, probeTimeout, userGesture)
-          if (res.state === 'connected') {
-            setApiBase(res.base)
-            set({
-              state: 'connected',
-              status: 'online',
-              connected: true,
-              base: res.base,
-              health: res.health || null,
-              failingAddress: null,
-              blockedOrigin: null,
-              lastCheckedAt: Date.now(),
-              attempts: 0,
-            })
-            try { sessionStorage.setItem('nexmind.serverSeen', '1') } catch {}
-            try { localStorage.setItem('nexmind.serverSeen', '1') } catch {}
-            if (!wasOnline && res.health) {
-              notifyJustConnected({ base: res.base, health: res.health })
+      const run = async (): Promise<boolean> => {
+        try {
+          const wasOnline = get().status === 'online' || get().connected
+          const candidates = getProbeCandidates()
+          const failures: ProbeResult[] = []
+
+          for (const base of candidates) {
+            const res = await probeCandidate(base, probeTimeout, userGesture)
+            if (res.state === 'connected') {
+              resetFailureTracking()
+              setCachedHealth(res.health || null)
+              setApiBase(res.base)
+              set({
+                state: 'connected',
+                status: 'online',
+                connected: true,
+                base: res.base,
+                health: res.health || null,
+                localPaths: isLocalPathsSupported({ health: res.health } as any),
+                failingAddress: null,
+                blockedOrigin: null,
+                lastCheckedAt: Date.now(),
+                attempts: 0,
+              })
+              try { sessionStorage.setItem('nexmind.serverSeen', '1') } catch {}
+              try { localStorage.setItem('nexmind.serverSeen', '1') } catch {}
+              if (!wasOnline && res.health) {
+                notifyJustConnected({ base: res.base, health: res.health })
+              }
+              return true
             }
-            return true
+            failures.push(res)
           }
-          failures.push(res)
-        }
 
-        const failurePriority: Record<ConnectionState, number> = {
-          'blocked-origin': 1,
-          'blocked-browser': 2,
-          'outdated': 3,
-          'other-app': 4,
-          'not-running': 5,
-          'connected': 6,
-        }
-        failures.sort((a, b) => failurePriority[a.state] - failurePriority[b.state])
-        const best = failures[0] || { state: 'not-running', base: candidates[0] || DEFAULT_API }
+          const failurePriority: Record<ConnectionState, number> = {
+            'blocked-origin': 1,
+            'blocked-browser': 2,
+            'outdated': 3,
+            'other-app': 4,
+            'not-running': 5,
+            'connected': 6,
+          }
+          failures.sort((a, b) => failurePriority[a.state] - failurePriority[b.state])
+          const best = failures[0] || { state: 'not-running', base: candidates[0] || DEFAULT_API }
 
+          const now = Date.now()
+          consecutiveFailures++
+          if (firstFailureTime === null) {
+            firstFailureTime = now
+          }
+          const failureSpan = now - firstFailureTime
+
+          const shouldDebounceOffline =
+            wasOnline &&
+            best.state === 'not-running' &&
+            !userGesture &&
+            (isHostedEnvironment() || isActivityInProgress())
+
+          if (shouldDebounceOffline && (consecutiveFailures < 3 || failureSpan < 6000)) {
+            // Under threshold: preserve connected/online status
+            set({
+              attempts: get().attempts + 1,
+              lastCheckedAt: now,
+            })
+            return false
+          }
+
+          set({
+            state: best.state,
+            status: 'offline',
+            connected: false,
+            health: null,
+            localPaths: isLocalPathsSupported({ health: null } as any),
+            failingAddress: best.base,
+            blockedOrigin: best.origin || null,
+            lastCheckedAt: now,
+            attempts: get().attempts + 1,
+          })
+          return false
+        } finally {
+          if (inFlight === promise) {
+            inFlight = null
+          }
+        }
+      }
+
+      const promise = run()
+      if (!userGesture) {
+        inFlight = promise
+      }
+      return promise
+    },
+    useBase: async (url: string) => {
+      const clean = url.trim().replace(/\/+$/, '')
+      if (!/^https?:\/\//.test(clean)) return false
+      const wasOnline = get().status === 'online' || get().connected
+      const res = await probeCandidate(clean, 2500, true)
+      if (res.state === 'connected') {
+        resetFailureTracking()
+        setCachedHealth(res.health || null)
+        setApiBase(clean)
         set({
-          state: best.state,
-          status: 'offline',
-          connected: false,
-          health: null,
-          failingAddress: best.base,
-          blockedOrigin: best.origin || null,
+          state: 'connected',
+          status: 'online',
+          connected: true,
+          base: clean,
+          health: res.health || null,
+          localPaths: isLocalPathsSupported({ health: res.health } as any),
+          failingAddress: null,
+          blockedOrigin: null,
           lastCheckedAt: Date.now(),
-          attempts: get().attempts + 1,
+          attempts: 0,
         })
-        return false
-      } finally {
-        if (inFlight === promise) {
-          inFlight = null
+        try { sessionStorage.setItem('nexmind.serverSeen', '1') } catch {}
+        try { localStorage.setItem('nexmind.serverSeen', '1') } catch {}
+        if (!wasOnline && res.health) {
+          notifyJustConnected({ base: clean, health: res.health })
         }
+        return true
       }
-    }
-
-    const promise = run()
-    if (!userGesture) {
-      inFlight = promise
-    }
-    return promise
-  },
-  useBase: async (url: string) => {
-    const clean = url.trim().replace(/\/+$/, '')
-    if (!/^https?:\/\//.test(clean)) return false
-    const wasOnline = get().status === 'online'
-    const res = await probeCandidate(clean, 2500, true)
-    if (res.state === 'connected') {
-      setApiBase(clean)
       set({
-        state: 'connected',
-        status: 'online',
-        connected: true,
-        base: clean,
-        health: res.health || null,
-        failingAddress: null,
-        blockedOrigin: null,
+        state: res.state,
+        status: 'offline',
+        connected: false,
+        health: null,
+        localPaths: isLocalPathsSupported({ health: null } as any),
+        failingAddress: clean,
+        blockedOrigin: res.origin || null,
         lastCheckedAt: Date.now(),
-        attempts: 0,
+        attempts: get().attempts + 1,
       })
-      try { sessionStorage.setItem('nexmind.serverSeen', '1') } catch {}
-      try { localStorage.setItem('nexmind.serverSeen', '1') } catch {}
-      if (!wasOnline && res.health) {
-        notifyJustConnected({ base: clean, health: res.health })
-      }
-      return true
-    }
-    set({
-      state: res.state,
-      status: 'offline',
-      connected: false,
-      health: null,
-      failingAddress: clean,
-      blockedOrigin: res.origin || null,
-      lastCheckedAt: Date.now(),
-      attempts: get().attempts + 1,
-    })
-    return false
-  },
-}))
+      return false
+    },
+  }
+})
 
 let timer: ReturnType<typeof setTimeout> | undefined
 let running = false
@@ -368,6 +478,10 @@ export function startServerWatch(): () => void {
   const loop = async () => {
     if (!running) return
     if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      return
+    }
+    if (isActivityInProgress()) {
+      scheduleNext(2000)
       return
     }
     const ok = await useServer.getState().check()

@@ -9,6 +9,7 @@ export interface Health {
   platform?: string
   python_executable?: string
   install_dir?: string
+  setup_required?: string | null
 }
 
 export interface Workspace {

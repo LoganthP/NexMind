@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS sources(
 );
 CREATE INDEX IF NOT EXISTS idx_sources_ws ON sources(workspace_id);
 CREATE TABLE IF NOT EXISTS files(
-  source_id TEXT NOT NULL, path TEXT NOT NULL, workspace_id TEXT NOT NULL, size BIGINT DEFAULT 0, data BLOB,
+  source_id TEXT NOT NULL, path TEXT NOT NULL, workspace_id TEXT NOT NULL, size BIGINT DEFAULT 0, data BLOB, sha1 TEXT,
   PRIMARY KEY(source_id, path)
 );
 CREATE INDEX IF NOT EXISTS idx_files_ws ON files(workspace_id);
@@ -74,6 +74,7 @@ MIGRATIONS = [
     ("sources", "watch", "INTEGER DEFAULT 0"),
     ("sources", "stored", "INTEGER DEFAULT 0"),
     ("jobs", "heartbeat", "REAL DEFAULT 0"),
+    ("files", "sha1", "TEXT"),
 ]
 POST_MIGRATION = ["CREATE INDEX IF NOT EXISTS idx_workspaces_owner ON workspaces(owner)"]
 

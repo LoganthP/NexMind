@@ -254,7 +254,7 @@ def test_connect_script_live_mode_against_real_server(tmp_path):
         (proj / "README.md").write_text("# My project\nUses `helper`.\n")
         cwd = tempfile.mkdtemp()
         out = subprocess.run([sys.executable, "-", str(proj), "--no-watch"], input=script, cwd=cwd, capture_output=True, timeout=120)
-        text = out.stdout.decode() + out.stderr.decode()
+        text = out.stdout.decode("utf-8", errors="replace") + out.stderr.decode("utf-8", errors="replace")
         assert out.returncode == 0, text
         assert "Connected myproj to NexMind" in text and "Graph ready" in text and "Traceback" not in text
         with TestClient(app) as c:
@@ -268,7 +268,8 @@ def test_connect_script_live_mode_against_real_server(tmp_path):
         # second run re-indexes the same workspace instead of creating another
         (proj / "extra.py").write_text("def extra_fn():\n    return 2\n")
         out2 = subprocess.run([sys.executable, "-", str(proj), "--no-watch"], input=script, cwd=cwd, capture_output=True, timeout=120)
-        assert out2.returncode == 0 and "re-indexing" in out2.stdout.decode()
+        assert out2.returncode == 0 and "re-indexing" in out2.stdout.decode("utf-8", errors="replace")
+        assert "1 changed file" in out2.stdout.decode("utf-8", errors="replace")
         with TestClient(app) as c:
             labels = {n["label"] for n in c.get(f"/api/workspaces/{wsid}/graph", headers=H(KEY_A)).json()["nodes"]}
             assert "extra_fn" in labels
@@ -278,3 +279,86 @@ def test_connect_script_live_mode_against_real_server(tmp_path):
     finally:
         server.should_exit = True
         th.join(timeout=10)
+
+
+def test_upload_resume_manifest_delta_and_isolation(client):
+    data = b"hello world from delta test" * 50_000
+    chunk_sz = 100_000
+    init = client.post("/api/uploads", json={"name": "test.zip", "size": len(data), "chunk_size": chunk_sz}, headers=H(KEY_A)).json()
+    uid = init["upload_id"]
+    assert init["chunks"] >= 2
+
+    # Send only chunk 0
+    client.put(f"/api/uploads/{uid}/chunks/0", content=data[:chunk_sz], headers=H(KEY_A))
+    st = client.get(f"/api/uploads/{uid}", headers=H(KEY_A)).json()
+    assert st["upload_id"] == uid and st["received"] == [0]
+
+    # Owner isolation: KEY_B cannot GET /api/uploads/{uid}
+    assert client.get(f"/api/uploads/{uid}", headers=H(KEY_B)).status_code == 404
+
+    # Send missing chunks
+    for i in range(1, init["chunks"]):
+        client.put(f"/api/uploads/{uid}/chunks/{i}", content=data[i * chunk_sz:(i + 1) * chunk_sz], headers=H(KEY_A))
+    st2 = client.get(f"/api/uploads/{uid}", headers=H(KEY_A)).json()
+    assert st2["received"] == list(range(init["chunks"]))
+
+    # Live connect initial upload with path_hint
+    hint = "delta-proj-hint-1"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("delta-proj/f1.py", "def fn_alpha():\n    return 1\n")
+        z.writestr("delta-proj/f2.py", "def fn_beta():\n    return 2\n")
+    uid_init = chunked_upload(client, KEY_A, "delta-proj.zip", buf.getvalue())
+    res1 = client.post("/api/connect/upload", json={"upload_id": uid_init, "path_hint": hint, "name": "delta-proj"}, headers=H(KEY_A)).json()
+    ws_id = res1["workspace_id"]
+    run_job(client, KEY_A, res1["job_id"])
+
+    # Manifest returns hashes
+    m1 = client.post("/api/sources/manifest", json={"path_hint": hint}, headers=H(KEY_A)).json()
+    assert m1["source_id"] is not None
+    assert "f1.py" in m1["files"] and "f2.py" in m1["files"]
+    sid = m1["source_id"]
+
+    # Owner isolation on manifest: KEY_B gets empty files
+    m_b = client.post("/api/sources/manifest", json={"path_hint": hint}, headers=H(KEY_B)).json()
+    assert m_b["source_id"] is None and m_b["files"] == {}
+
+    # Delta upsert: add fn_gamma to f1.py, delete f2.py
+    buf2 = io.BytesIO()
+    with zipfile.ZipFile(buf2, "w") as z:
+        z.writestr("delta-proj/f1.py", "def fn_alpha():\n    return 1\n\ndef fn_gamma():\n    return 3\n")
+    uid_delta = chunked_upload(client, KEY_A, "delta.zip", buf2.getvalue())
+    res_delta = client.post("/api/connect/delta", json={
+        "path_hint": hint,
+        "upload_id": uid_delta,
+        "deleted": ["f2.py"],
+    }, headers=H(KEY_A)).json()
+    run_job(client, KEY_A, res_delta["job_id"])
+
+    # Verify graph: fn_gamma appears, fn_beta disappears
+    g = client.get(f"/api/workspaces/{ws_id}/graph", headers=H(KEY_A)).json()
+    labels = {n["label"] for n in g["nodes"]}
+    assert "fn_gamma" in labels
+    assert "fn_beta" not in labels
+
+    # Delta re-upload without changes: unchanged files not rewritten
+    res_noop = client.post("/api/connect/delta", json={
+        "path_hint": hint,
+        "upload_id": None,
+        "deleted": [],
+    }, headers=H(KEY_A)).json()
+    assert res_noop["reused"] is True
+
+    # Projects source delta endpoint: POST /api/workspaces/{id}/sources/{sid}/delta
+    res_src_delta = client.post(f"/api/workspaces/{ws_id}/sources/{sid}/delta", json={
+        "upload_id": None,
+        "deleted": [],
+    }, headers=H(KEY_A))
+    assert res_src_delta.status_code == 200
+
+    # Owner isolation: KEY_B cannot call delta on A's source
+    res_src_delta_b = client.post(f"/api/workspaces/{ws_id}/sources/{sid}/delta", json={
+        "upload_id": None,
+        "deleted": [],
+    }, headers=H(KEY_B))
+    assert res_src_delta_b.status_code in (403, 404)

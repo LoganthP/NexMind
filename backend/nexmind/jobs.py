@@ -19,9 +19,9 @@ from typing import Callable, Iterator
 
 from .config import settings
 from .db import DB, dumps, now, new_id
-from .events import EventLog
+from .events import EventLog, hub
 from .graph.store import GraphStore
-from .ingest.pipeline import build_workspace_graph
+from .ingest.pipeline import build_workspace_graph, stream_graph
 from .storage import FileStore, remove_tree
 
 log = logging.getLogger("nexmind.jobs")
@@ -117,6 +117,7 @@ class JobManager:
 
         def emit(type_: str, **kw) -> None:
             if type_ in ("graph_stream_start", "graph_batch", "graph_ready"):
+                hub.publish(ws_id, {"type": type_, **kw})
                 return  # browsers fetch the finished graph over HTTP instead
             t = time.time()
             if type_ == "progress":
@@ -145,6 +146,8 @@ class JobManager:
                 elif src.get("path"):
                     roots[src["id"]] = Path(src["path"])
             stats = build_workspace_graph(ws_id, self.db, self.store, emit, roots=roots)
+            if stats.get("nodes"):
+                stream_graph(ws_id, self.store, emit)
             self.db.execute("UPDATE jobs SET status='done', progress=100, phase='done', message='Graph ready', result=?, updated_at=? WHERE id=?",
                             (dumps(stats), now(), job_id))
             if not stats.get("nodes"):

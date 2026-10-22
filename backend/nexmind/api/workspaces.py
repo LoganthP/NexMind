@@ -24,7 +24,7 @@ from ..storage import read_source_file
 router = APIRouter(prefix="/api", tags=["workspaces"])
 
 DOCS_ONLY_MSG = "Document workspaces take PDFs, Word, Markdown, text and zip files."
-LIVE_MSG = "Live workspaces are connected from a folder with the Live connect command."
+LIVE_MSG = "Live workspaces are connected from a folder. Use the Live connect command."
 CODE_PDF_MSG = "Project workspaces take repositories or project archives. Use a Documents workspace for PDFs."
 LOCAL_ONLY_MSG = ("Folders on your computer can only be opened by a NexMind server running on your computer. "
                   "In the hosted app, use 'Upload a project folder' or the Live connect command.")
@@ -65,6 +65,17 @@ class UploadInit(BaseModel):
 class UploadsIngest(BaseModel):
     upload_ids: list[str] = Field(min_length=1, max_length=200)
     name: str | None = Field(default=None, max_length=120)
+
+
+class ManifestIn(BaseModel):
+    path_hint: str | None = None
+    workspace_id: str | None = None
+    source_id: str | None = None
+
+
+class SourceDeltaIn(BaseModel):
+    upload_id: str | None = None
+    deleted: list[str] = Field(default_factory=list)
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -320,6 +331,70 @@ def raw_file(ws_id: str, source_id: str, path: str):
     return Response(data, media_type=media, headers={"Content-Disposition": f'inline; filename="{_safe_name(path)}"'})
 
 
+@router.post("/sources/manifest")
+def source_manifest(body: ManifestIn) -> dict:
+    require_storage()
+    sid: str | None = None
+    if body.source_id:
+        src = db.one("SELECT s.id, w.owner FROM sources s JOIN workspaces w ON w.id=s.workspace_id WHERE s.id=?", (body.source_id,))
+        if not src or not can_access(src.get("owner")):
+            raise HTTPException(404, "Source not found")
+        sid = src["id"]
+    elif body.workspace_id:
+        ws = get_ws(body.workspace_id)
+        src = db.one("SELECT id FROM sources WHERE workspace_id=? AND stored=1 ORDER BY created_at LIMIT 1", (ws["id"],))
+        if src:
+            sid = src["id"]
+    elif body.path_hint:
+        hint = body.path_hint.strip()
+        clause = " AND w.owner=?" if isolated() else ""
+        params = (current_owner(),) if isolated() else ()
+        src = db.one(
+            "SELECT s.id FROM sources s JOIN workspaces w ON w.id=s.workspace_id "
+            "WHERE w.kind='live' AND s.origin=? AND s.stored=1" + clause + " LIMIT 1",
+            (hint, *params),
+        )
+        if src:
+            sid = src["id"]
+
+    if not sid:
+        return {"source_id": None, "files": {}}
+    return {"source_id": sid, "files": files.manifest(sid)}
+
+
+@router.post("/workspaces/{ws_id}/sources/{source_id}/delta")
+def source_delta(ws_id: str, source_id: str, body: SourceDeltaIn) -> dict:
+    ws = get_ws(ws_id)
+    require_storage()
+    src = db.one("SELECT * FROM sources WHERE id=? AND workspace_id=?", (source_id, ws["id"]))
+    if not src:
+        raise HTTPException(404, "Source not found")
+
+    stage = _tmpdir("nexmind-sd-")
+    out = _tmpdir("nexmind-sdx-")
+    try:
+        added_root: Path | None = None
+        if body.upload_id:
+            name, archive = assemble_upload(body.upload_id, stage)
+            if name.lower().endswith(".zip") or str(archive).lower().endswith(".zip"):
+                safe_extract_zip(archive, out)
+            else:
+                safe_extract_tar(archive, out)
+            added_root = collapse_single_root(out)
+        files.apply_delta(ws["id"], source_id, added_root, body.deleted)
+    except IngestError as e:
+        raise HTTPException(400, str(e)) from e
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+        shutil.rmtree(stage, ignore_errors=True)
+    if body.upload_id:
+        discard_uploads([body.upload_id])
+
+    job_id = jobs.submit(ws["id"], "rebuild")
+    events.add(ws["id"], "source_changed", job_id, source_id=source_id)
+    return {"workspace_id": ws["id"], "source_id": source_id, "job_id": job_id}
+
+
 # ----------------------------------------------------------------------------- chunked uploads (Vercel limits one request to 4.5 MB)
 
 def _chunk_bytes() -> int:
@@ -364,6 +439,17 @@ async def upload_chunk(uid: str, idx: int, request: Request) -> dict:
     db.execute("INSERT INTO upload_chunks(upload_id, idx, data) VALUES(?,?,?)", (uid, idx, data))
     got = db.one("SELECT COUNT(*) AS n FROM upload_chunks WHERE upload_id=?", (uid,))
     return {"upload_id": uid, "received_chunks": got["n"] if got else 0, "chunks": up["chunks"]}
+
+
+@router.get("/uploads/{uid}")
+def upload_status(uid: str) -> dict:
+    up = _upload_row(uid)
+    rows = db.query("SELECT idx FROM upload_chunks WHERE upload_id=? ORDER BY idx", (uid,))
+    return {
+        "upload_id": uid,
+        "chunks": up["chunks"],
+        "received": [r["idx"] for r in rows],
+    }
 
 
 def assemble_upload(uid: str, dest_dir: Path) -> tuple[str, Path]:

@@ -137,12 +137,12 @@ describe('Folder Selection on Hosted / Vercel Backend', () => {
       fireEvent.change(fileInput, { target: { files: [validFile] } })
     })
 
-    // Packed summary shown with "Change" link
+    // Packed summary shown with "Change folder" link
     expect(await screen.findByText(/Packed 1 files · .* from my-cool-app/i)).toBeTruthy()
-    expect(screen.getByRole('button', { name: /Change/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Change folder/i })).toBeTruthy()
 
     // Analyze project uploads in chunks and creates kind 'code' workspace
-    const analyzeBtn = screen.getByRole('button', { name: /Analyze project/i }) as HTMLButtonElement
+    const analyzeBtn = (await screen.findByRole('button', { name: /Analyze 1 files/i })) as HTMLButtonElement
     expect(analyzeBtn.disabled).toBe(false)
 
     await act(async () => {
@@ -161,8 +161,9 @@ describe('Folder Selection on Hosted / Vercel Backend', () => {
       value: 'empty-repo/.git/config',
     })
 
-    // Click Change to reset
-    fireEvent.click(screen.getByRole('button', { name: /Change/i }))
+    // Click Change folder to reset if still reviewing
+    const changeBtn = screen.queryByRole('button', { name: /Change folder/i })
+    if (changeBtn) fireEvent.click(changeBtn)
 
     const freshInput = container.querySelector('input[type="file"][webkitdirectory]') as HTMLInputElement
     expect(freshInput).toBeTruthy()
@@ -269,6 +270,15 @@ describe('Folder Selection on Hosted / Vercel Backend', () => {
 
     await waitFor(() => {
       expect((window as any).showDirectoryPicker).toHaveBeenCalled()
+      expect(screen.getByRole('button', { name: /Connect 1 files/i })).toBeTruthy()
+    })
+
+    const connectBtn = screen.getByRole('button', { name: /Connect 1 files/i })
+    await act(async () => {
+      fireEvent.click(connectBtn)
+    })
+
+    await waitFor(() => {
       expect(api.connectUpload).toHaveBeenCalledTimes(1)
     })
 
@@ -335,9 +345,14 @@ describe('Folder Selection on Hosted / Vercel Backend', () => {
     const fallbackFile = new File(['export const z = 99'], 'app.ts', { type: 'text/typescript' })
     Object.defineProperty(fallbackFile, 'webkitRelativePath', { value: 'safari-project/app.ts' })
 
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
     await act(async () => {
       fireEvent.change(fallbackInput, { target: { files: [fallbackFile] } })
+    })
+
+    const fallbackConnectBtn = screen.getByRole('button', { name: /Connect 1 files/i })
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
+    await act(async () => {
+      fireEvent.click(fallbackConnectBtn)
     })
 
     // Advance 1300ms so connectedSession splash finishes and normal view restores with Re-sync now

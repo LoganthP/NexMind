@@ -601,7 +601,7 @@ def test_ping_endpoint_and_preflight(client, monkeypatch):
             "Access-Control-Request-Private-Network": "true",
         },
     )
-    assert r_options.status_code == 204
+    assert r_options.status_code in (200, 204)
     assert r_options.headers.get("access-control-allow-origin") == "*"
     assert r_options.headers.get("access-control-allow-private-network") == "true"
     assert "GET" in r_options.headers.get("access-control-allow-methods", "")

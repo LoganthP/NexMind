@@ -7,6 +7,7 @@ Local folders connected in place (local mode only) are read straight from disk i
 from __future__ import annotations
 
 import gzip
+import hashlib
 import shutil
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from .ingest.files import walk_source
 
 
 class FileStore:
-    BATCH = 150
+    BATCH = 500
 
     def __init__(self, db: DB):
         self.db = db
@@ -28,7 +29,7 @@ class FileStore:
 
         def flush() -> None:
             if rows:
-                self.db.executemany("INSERT INTO files(source_id, path, workspace_id, size, data) VALUES(?,?,?,?,?)", rows)
+                self.db.executemany("INSERT INTO files(source_id, path, workspace_id, size, data, sha1) VALUES(?,?,?,?,?,?)", rows)
                 rows.clear()
 
         for fe in walk_source(root):
@@ -36,12 +37,57 @@ class FileStore:
                 raw = fe.abs.read_bytes()
             except OSError:
                 continue
-            rows.append((source_id, fe.rel, ws_id, len(raw), gzip.compress(raw, compresslevel=5)))
+            sha1 = hashlib.sha1(raw).hexdigest()
+            rows.append((source_id, fe.rel, ws_id, len(raw), gzip.compress(raw, compresslevel=5), sha1))
             count += 1
             total += len(raw)
             if len(rows) >= self.BATCH:
                 flush()
         flush()
+        return count, total
+
+    def manifest(self, source_id: str) -> dict[str, str]:
+        rows = self.db.query("SELECT path, sha1 FROM files WHERE source_id=?", (source_id,))
+        return {r["path"]: r["sha1"] or "" for r in rows}
+
+    def apply_delta(self, ws_id: str, source_id: str, added_root: Path | None, deleted_paths: list[str]) -> tuple[int, int]:
+        if deleted_paths:
+            for p in deleted_paths:
+                self.db.execute("DELETE FROM files WHERE source_id=? AND path=?", (source_id, p))
+
+        if added_root and added_root.exists():
+            existing = self.manifest(source_id)
+            rows: list[tuple] = []
+
+            def flush() -> None:
+                if rows:
+                    if self.db.dialect == "postgres":
+                        sql = (
+                            "INSERT INTO files(source_id, path, workspace_id, size, data, sha1) VALUES(?,?,?,?,?,?) "
+                            "ON CONFLICT(source_id, path) DO UPDATE SET size=EXCLUDED.size, data=EXCLUDED.data, sha1=EXCLUDED.sha1, workspace_id=EXCLUDED.workspace_id"
+                        )
+                    else:
+                        sql = "INSERT OR REPLACE INTO files(source_id, path, workspace_id, size, data, sha1) VALUES(?,?,?,?,?,?)"
+                    self.db.executemany(sql, rows)
+                    rows.clear()
+
+            for fe in walk_source(added_root):
+                try:
+                    raw = fe.abs.read_bytes()
+                except OSError:
+                    continue
+                sha1 = hashlib.sha1(raw).hexdigest()
+                if existing.get(fe.rel) == sha1:
+                    continue
+                rows.append((source_id, fe.rel, ws_id, len(raw), gzip.compress(raw, compresslevel=5), sha1))
+                if len(rows) >= self.BATCH:
+                    flush()
+            flush()
+
+        r = self.db.one("SELECT COUNT(*) AS c, SUM(size) AS s FROM files WHERE source_id=?", (source_id,))
+        count = int(r["c"] or 0) if r else 0
+        total = int(r["s"] or 0) if r else 0
+        self.db.execute("UPDATE sources SET file_count=?, size=?, stored=1 WHERE id=?", (count, total, source_id))
         return count, total
 
     def materialize(self, source_id: str, dest: Path) -> int:

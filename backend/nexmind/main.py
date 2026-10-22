@@ -18,9 +18,11 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import asyncio
 from . import __version__
-from .api import chat_routes, connect, connect_script, events as events_api, graph_routes, workspaces
+from .api import chat_routes, connect, connect_script, events as events_api, graph_routes, workspaces, ws
 from .config import settings
+from .events import hub
 from .ingest.files import IngestError
 from .owner import OwnerMiddleware
 from .rag.llm import LLM, get_llm, set_llm
@@ -33,6 +35,7 @@ log = logging.getLogger("nexmind")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    hub.bind_loop(asyncio.get_running_loop())
     if settings.allow_local_paths and not settings.hosted:
         watcher.start()
     log.info("NexMind %s ready (%s, storage=%s, hosted=%s, LLM=%s)", __version__,
@@ -85,12 +88,14 @@ app.include_router(chat_routes.router)
 app.include_router(events_api.router)
 app.include_router(connect.router)
 app.include_router(connect_script.router)
+app.include_router(ws.router)
 
 
 @app.get("/api/ping", tags=["system"])
-def ping(request: Request) -> dict:
+def ping(request: Request) -> JSONResponse:
     origin = request.headers.get("origin")
-    return {"app": "nexmind", "ok": True, "version": __version__, "origin_allowed": is_origin_allowed(origin), "origin": origin}
+    data = {"app": "nexmind", "ok": True, "version": __version__, "origin_allowed": is_origin_allowed(origin), "origin": origin}
+    return JSONResponse(content=data, headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Private-Network": "true"})
 
 
 def setup_problem() -> str | None:

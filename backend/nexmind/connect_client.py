@@ -34,9 +34,11 @@ MAX_TOTAL = 100 * 1024 * 1024
 
 def say(msg=""):
     try:
+        if isinstance(msg, str):
+            msg = msg.encode("ascii", "replace").decode("ascii")
         print(msg, flush=True)
-    except UnicodeEncodeError:
-        print(msg.encode("ascii", "replace").decode(), flush=True)
+    except Exception:
+        pass
 
 
 class Fail(Exception):
@@ -136,6 +138,82 @@ def make_zip(root):
     return buf.getvalue(), files
 
 
+def file_sha1(path):
+    import hashlib
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def scan_source_files(root):
+    result = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in IGNORED_DIRS and not d.startswith("."))
+        for fn in sorted(filenames):
+            low = fn.lower()
+            if any(low.endswith(ext) for ext in BINARY_EXT) or fn.startswith("."):
+                continue
+            full = os.path.join(dirpath, fn)
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                continue
+            if size == 0 or size > MAX_FILE:
+                continue
+            rel = os.path.relpath(full, root).replace(os.sep, "/")
+            result[rel] = full
+    return result
+
+
+def make_delta_zip(root, paths_to_include):
+    buf = io.BytesIO()
+    top = os.path.basename(os.path.abspath(root)) or "project"
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for rel in sorted(paths_to_include):
+            full = os.path.join(root, rel.replace("/", os.sep))
+            z.write(full, top + "/" + rel)
+    return buf.getvalue()
+
+
+def sync_hosted(client, root, name, watch):
+    files_map = scan_source_files(root)
+    manifest_res = {}
+    try:
+        manifest_res = client.call("POST", "/api/sources/manifest", {"path_hint": root})
+    except Exception:
+        pass
+
+    server_files = manifest_res.get("files") if isinstance(manifest_res, dict) else {}
+    if not server_files or not manifest_res.get("source_id"):
+        data, n = make_zip(root)
+        say("  Uploading %d files (%.1f MB)..." % (n, len(data) / 1048576.0))
+        uid = upload(client, os.path.basename(root) + ".zip", data)
+        return client.call("POST", "/api/connect/upload", {"upload_id": uid, "path_hint": root, "name": name, "watch": watch}, timeout=300)
+
+    changed_or_new = []
+    for rel, full in files_map.items():
+        h = file_sha1(full)
+        if server_files.get(rel) != h:
+            changed_or_new.append(rel)
+    deleted = [p for p in server_files.keys() if p not in files_map]
+
+    if not changed_or_new and not deleted:
+        return client.call("POST", "/api/connect/delta", {"path_hint": root, "upload_id": None, "deleted": [], "name": name, "watch": watch}, timeout=300)
+
+    uid = None
+    if changed_or_new:
+        data = make_delta_zip(root, changed_or_new)
+        say("  Uploading %d changed file%s (%.1f MB)..." % (len(changed_or_new), "" if len(changed_or_new) == 1 else "s", len(data) / 1048576.0))
+        uid = upload(client, os.path.basename(root) + ".zip", data)
+
+    return client.call("POST", "/api/connect/delta", {"path_hint": root, "upload_id": uid, "deleted": deleted, "name": name, "watch": watch}, timeout=300)
+
+
 def upload(client, name, data):
     init = client.call("POST", "/api/uploads", {"name": name, "size": len(data)})
     size = int(init["chunk_size"])
@@ -228,10 +306,7 @@ def main(argv=None):
         if local:
             res = client.call("POST", "/api/connect", {"path": root, "name": name, "watch": watch})
         else:
-            data, n = make_zip(root)
-            say("  Uploading %d files (%.1f MB)..." % (n, len(data) / 1048576.0))
-            uid = upload(client, os.path.basename(root) + ".zip", data)
-            res = client.call("POST", "/api/connect/upload", {"upload_id": uid, "path_hint": root, "name": name, "watch": watch}, timeout=300)
+            res = sync_hosted(client, root, name, watch)
         say("")
         say("Connected %s to NexMind%s" % (res.get("name", os.path.basename(root)), " (re-indexing)" if res.get("reused") else ""))
         site = health.get("web_url") if local else server
@@ -260,9 +335,7 @@ def main(argv=None):
             pending = None
             say("")
             say("  Files changed, updating the graph...")
-            data, n = make_zip(root)
-            uid = upload(client, os.path.basename(root) + ".zip", data)
-            res = client.call("POST", "/api/connect/upload", {"upload_id": uid, "path_hint": root, "name": name, "watch": True}, timeout=300)
+            res = sync_hosted(client, root, name, True)
             run_job(client, res["job_id"])
     except Fail as e:
         say(str(e))

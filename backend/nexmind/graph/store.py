@@ -158,11 +158,15 @@ class GraphStore:
             self._checked.pop(ws_id, None)
 
     def _write(self, ws_id: str, core: dict, chunks: list[dict]) -> str:
+        if not self.db.one("SELECT id FROM workspaces WHERE id=?", (ws_id,)):
+            return ""
         version = new_id("v")
         t = now()
         core_blob, chunk_blob = _pack(core), _pack(chunks)
 
         def tx(c):
+            if not self.db.one("SELECT id FROM workspaces WHERE id=?", (ws_id,)):
+                return
             c.execute("DELETE FROM graphs WHERE workspace_id IN (?, ?)", (ws_id, ws_id + "#chunks"))
             c.execute("INSERT INTO graphs(workspace_id, version, data, updated_at) VALUES(?,?,?,?)", (ws_id, version, core_blob, t))
             c.execute("INSERT INTO graphs(workspace_id, version, data, updated_at) VALUES(?,?,?,?)", (ws_id + "#chunks", version, chunk_blob, t))
