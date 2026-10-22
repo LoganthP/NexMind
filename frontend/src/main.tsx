@@ -11,6 +11,7 @@ if (typeof window !== 'undefined') {
 }
 
 document.documentElement.dataset.solid = String(useSettings.getState().solid)
+document.documentElement.dataset.perf = String(useSettings.getState().perf)
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

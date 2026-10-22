@@ -11,9 +11,9 @@ import {
   RotateCcw,
   Terminal,
 } from 'lucide-react'
-import { api, formatApiError, ApiError } from '@/lib/api'
+import { api, formatApiError, ApiError, getApiBase } from '@/lib/api'
 import { useServer } from '@/lib/server'
-import { detectOS, type OS } from '@/lib/os'
+import { connectScriptUrl, detectOS, type OS } from '@/lib/os'
 import { CopyBlock, Spinner, Switch } from './ui'
 import { FolderPicker } from './FolderPicker'
 import { ServerStatusBar } from './ServerStatusBar'
@@ -53,15 +53,15 @@ export function ConnectPanel({ onSuccess, onClose }: Props) {
   const timerRef = useRef<any>(null)
   const inFlightConnectRef = useRef(false)
 
-  const serverBase = (base || 'http://127.0.0.1:8000').replace(/\/+$/, '')
+  const serverBase = (base || getApiBase()).replace(/\/+$/, '')
 
   // Universal connect commands: never contain "&&"
   const getCommand = (system: OS) => {
-    const scriptUrl = `${serverBase}/connect.py`
+    const scriptUrl = connectScriptUrl(serverBase)
     if (system === 'windows') {
-      return `irm ${scriptUrl} | python - .`
+      return `irm "${scriptUrl}" | python - .`
     }
-    return `curl -fsSL ${scriptUrl} | python3 - .`
+    return `curl -fsSL "${scriptUrl}" | python3 - .`
   }
 
   const universalCommand = getCommand(os)
@@ -282,7 +282,7 @@ export function ConnectPanel({ onSuccess, onClose }: Props) {
         <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-mist pt-0.5">
           <span>Run it from your project&apos;s root folder.</span>
           <a
-            href={`${serverBase}/connect.py`}
+            href={connectScriptUrl(serverBase)}
             target="_blank"
             rel="noreferrer"
             className="inline-flex items-center gap-1 text-coral hover:underline"

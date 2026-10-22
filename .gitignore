@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.env
+.env.local
+.vercel/
+data/
+backend/data/
+backend/frontend_dist/
+test-results/
+playwright-report/
+.pytest_cache/

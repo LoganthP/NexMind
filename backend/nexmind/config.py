@@ -45,9 +45,27 @@ def _detect_provider() -> str:
     return "offline"
 
 
+ON_VERCEL = bool(os.environ.get("VERCEL")) or bool(os.environ.get("VERCEL_ENV"))
+# "hosted" = running as a shared web service (Vercel or any cloud): no access to the visitor's disk,
+# no background threads, uploads go through the chunked API, every browser gets its own private space.
+HOSTED = _bool("NEXMIND_HOSTED", ON_VERCEL)
+
+
+def _default_data_dir() -> str:
+    if os.environ.get("NEXMIND_DATA_DIR"):
+        return os.environ["NEXMIND_DATA_DIR"]
+    return "/tmp/nexmind" if ON_VERCEL else "./data"
+
+
 @dataclass
 class Settings:
-    data_dir: Path = field(default_factory=lambda: Path(os.environ.get("NEXMIND_DATA_DIR", "./data")).resolve())
+    data_dir: Path = field(default_factory=lambda: Path(_default_data_dir()).resolve())
+    hosted: bool = HOSTED
+    on_vercel: bool = ON_VERCEL
+    background_jobs: bool = _bool("NEXMIND_BACKGROUND_JOBS", not HOSTED)  # serverless: jobs run inside a request
+    upload_chunk_mb: float = _float("NEXMIND_UPLOAD_CHUNK_MB", 3.5)  # below Vercel's 4.5 MB request limit
+    max_workspaces_per_owner: int = _int("NEXMIND_MAX_WORKSPACES", 30)
+    job_stale_s: int = _int("NEXMIND_JOB_STALE_S", 330)  # a "running" job without heartbeat for this long is retried
     host: str = os.environ.get("NEXMIND_HOST", "127.0.0.1")
     port: int = _int("NEXMIND_PORT", 8000)
     cors_origins: list[str] = field(
@@ -56,7 +74,7 @@ class Settings:
     cors_origin_regex: str | None = os.environ.get("NEXMIND_CORS_ORIGIN_REGEX")
 
     # --- ingestion limits (protect your machine from zip bombs / huge uploads) ---
-    max_upload_mb: int = _int("NEXMIND_MAX_UPLOAD_MB", 300)
+    max_upload_mb: int = _int("NEXMIND_MAX_UPLOAD_MB", 120 if HOSTED else 300)
     max_unzipped_mb: int = _int("NEXMIND_MAX_UNZIPPED_MB", 1500)
     max_files: int = _int("NEXMIND_MAX_FILES", 25000)
     max_file_kb: int = _int("NEXMIND_MAX_FILE_KB", 1024)  # per-file parse limit
@@ -65,7 +83,7 @@ class Settings:
             h.strip() for h in os.environ.get("NEXMIND_GIT_HOSTS", "github.com,gitlab.com,bitbucket.org,codeberg.org,dev.azure.com").split(",") if h.strip()
         ]
     )
-    allow_local_paths: bool = _bool("NEXMIND_ALLOW_LOCAL_PATHS", True)  # index folders on this machine in place
+    allow_local_paths: bool = _bool("NEXMIND_ALLOW_LOCAL_PATHS", not HOSTED)  # index folders on this machine in place
     web_url: str = os.environ.get("FRONTEND_URL") or os.environ.get("NEXMIND_WEB_URL", "http://localhost:5173")  # where your frontend lives (printed by `nexmind serve`)
     git_timeout_s: int = _int("NEXMIND_GIT_TIMEOUT", 180)
 

@@ -120,6 +120,10 @@ def test_cors_and_private_network_preflight(client):
 
 
 def test_spa_fallback(client):
+    import pytest
+    from pathlib import Path
+    if not (Path(__file__).resolve().parent.parent / 'frontend_dist' / 'index.html').exists():
+        pytest.skip('frontend_dist not built (npm run build:local)')
     # Root path
     r_root = client.get("/")
     assert r_root.status_code == 200

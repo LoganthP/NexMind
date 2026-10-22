@@ -1,0 +1,12 @@
+node_modules
+frontend/node_modules
+backend/tests
+backend/tests_hosted
+backend/data
+backend/frontend_dist
+backend/samples
+backend/.venv
+e2e
+test-results
+playwright-report
+**/__pycache__

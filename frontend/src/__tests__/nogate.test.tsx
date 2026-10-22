@@ -233,7 +233,7 @@ describe('requirement 5: acceptance and guard rails', () => {
     expect(fixtureExitCode).not.toBe(0)
   })
 
-  it('(e) the build stamp renders in the Hub footer and on window', async () => {
+  it('(e) the build stamp is on window and not displayed in the footer', async () => {
     localStorage.setItem('nexmind.api', 'http://127.0.0.1:59999')
     useServer.setState({ status: 'offline', base: 'http://127.0.0.1:59999', attempts: 1, health: null })
 
@@ -247,8 +247,7 @@ describe('requirement 5: acceptance and guard rails', () => {
       </MemoryRouter>
     )
 
-    // Footer shows "build ..."
-    expect(await screen.findByText(/build /i)).toBeTruthy()
+    expect(screen.queryByText(/build /i)).toBeNull()
     expect(window.__NEXMIND_BUILD__).toBeDefined()
   })
 })

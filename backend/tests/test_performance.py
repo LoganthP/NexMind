@@ -71,17 +71,10 @@ def large_graph_workspace():
             eid = f"e_{u}_{v}"
             edge_rows.append((ws_id, eid, u, v, "CALLS", float(d.get("weight", 1.0)), "{}"))
 
-        with db.tx() as cur:
-            cur.executemany(
-                "INSERT INTO nodes(workspace_id,id,type,label,props,x,y,z,cluster,score) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                node_rows,
-            )
-            cur.executemany(
-                "INSERT INTO edges(workspace_id,id,src,dst,type,weight,props) VALUES(?,?,?,?,?,?,?)",
-                edge_rows,
-            )
-            cur.execute("UPDATE workspaces SET status='ready' WHERE id=?", (ws_id,))
-
+        gnodes = {r[1]: {"id": r[1], "type": r[2], "label": r[3], "props": {}, "x": r[5], "y": r[6], "z": r[7], "cluster": r[8], "score": r[9]} for r in node_rows}
+        gedges = {r[1]: {"id": r[1], "src": r[2], "dst": r[3], "type": r[4], "weight": r[5], "props": {}} for r in edge_rows}
+        store.save(ws_id, gnodes, gedges, [], [], [])
+        db.execute("UPDATE workspaces SET status='ready' WHERE id=?", (ws_id,))
         store.invalidate(ws_id)
         build_time = time.perf_counter() - t0
 

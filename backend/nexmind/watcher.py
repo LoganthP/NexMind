@@ -7,9 +7,9 @@ import threading
 import time
 from pathlib import Path
 
-from .events import hub
 from .ingest.files import walk_source
-from .state import db, jobs
+from .config import settings
+from .state import db, events, jobs
 
 log = logging.getLogger("nexmind.watcher")
 
@@ -23,6 +23,8 @@ class Watcher:
         self._pending: dict[str, tuple[tuple[int, float, int], float]] = {}
 
     def start(self):
+        if not settings.allow_local_paths:
+            return
         if self._thread is None:
             self._stop.clear()
             self._wake.clear()
@@ -42,6 +44,8 @@ class Watcher:
         self._wake.set()
 
     def register_source(self, sid: str, path: Path):
+        if not settings.allow_local_paths:
+            return  # hosted: the connect command watches the folder on the user's computer
         try:
             self._last_sig[sid] = self._compute_sig(path)
             self._pending.pop(sid, None)
@@ -74,7 +78,7 @@ class Watcher:
             interval = float(os.environ.get("NEXMIND_WATCH_INTERVAL", "2.0"))
             settle = float(os.environ.get("NEXMIND_WATCH_SETTLE", "3.0" if interval >= 1.0 else str(max(0.3, interval * 1.5))))
             try:
-                sources = db.query("SELECT id, workspace_id, path FROM sources WHERE watch=1")
+                sources = db.query("SELECT id, workspace_id, path FROM sources WHERE watch=1 AND (stored=0 OR stored IS NULL) AND path<>''")
                 active_sids = {s["id"] for s in sources}
                 for sid in list(self._last_sig.keys()):
                     if sid not in active_sids:
@@ -117,8 +121,8 @@ class Watcher:
                             row = db.one("SELECT COUNT(*) AS n FROM jobs WHERE workspace_id=? AND status IN ('queued', 'running')", (ws_id,))
                             if not (row and row["n"] > 0):
                                 log.info("Source %s in workspace %s changed and stabilized. Triggering rebuild.", sid, ws_id)
-                                jobs.submit(ws_id, "rebuild")
-                                hub.publish(ws_id, {"type": "source_changed", "source_id": sid})
+                                job_id = jobs.submit(ws_id, "rebuild")
+                                events.add(ws_id, "source_changed", job_id, source_id=sid)
                                 self._last_sig[sid] = sig
                                 self._pending.pop(sid, None)
 

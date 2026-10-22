@@ -77,12 +77,21 @@ export function Toasts() {
 
 export function Switch({ checked, onChange, label }: { checked: boolean; onChange: (v: boolean) => void; label: string }) {
   return (
-    <button role="switch" aria-checked={checked} onClick={() => onChange(!checked)} className="flex w-full items-center justify-between gap-3 rounded-lg px-1 py-1.5 text-left text-sm hover:bg-white/5">
+    <label className="flex w-full cursor-pointer items-center justify-between gap-3 rounded-lg px-1 py-1.5 text-left text-sm hover:bg-white/5 select-none">
       <span>{label}</span>
-      <span className={`relative h-5 w-9 rounded-full transition-colors ${checked ? 'bg-plankton' : 'bg-white/15'}`}>
-        <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${checked ? 'left-[1.15rem]' : 'left-0.5'}`} />
+      <span className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${checked ? 'bg-plankton' : 'bg-white/15'}`}>
+        <input
+          type="checkbox"
+          className="absolute inset-0 cursor-pointer opacity-0 z-10"
+          checked={checked}
+          onChange={(e) => onChange(e.target.checked)}
+          role="switch"
+          aria-checked={checked}
+          aria-label={label}
+        />
+        <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-all pointer-events-none ${checked ? 'left-[1.15rem]' : 'left-0.5'}`} />
       </span>
-    </button>
+    </label>
   )
 }
 

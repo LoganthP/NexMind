@@ -2,8 +2,8 @@
 
 <img src="assets/nexmind-banner.svg" alt="NexMind" width="100%"/>
 
-<a href="https://nexmind-three.vercel.app">
-  <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=22&pause=1000&color=818CF8&center=true&vCenter=true&width=720&lines=Analyze+any+GitHub+%2F+GitLab+%2F+Azure+DevOps+repo;Watch+your+code+become+a+3D+knowledge+graph;Ask+questions.+Get+cited+answers.;Local-first.+Your+code+never+leaves+your+machine." alt="Typing animation"/>
+<a href="https://nexmind-livid.vercel.app">
+  <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=22&pause=1000&color=818CF8&center=true&vCenter=true&width=720&lines=Analyze+any+GitHub+%2F+GitLab+%2F+Azure+DevOps+repo;Watch+your+code+become+a+3D+knowledge+graph;Ask+questions.+Get+cited+answers.;Runs+on+Vercel+or+on+your+own+machine." alt="Typing animation"/>
 </a>
 
 <br/>
@@ -25,7 +25,7 @@
 
 <br/><br/>
 
-[**🌐 Live Demo**](https://nexmind-three.vercel.app) &nbsp;·&nbsp;
+[**🌐 Live Demo**](https://nexmind-livid.vercel.app) &nbsp;·&nbsp;
 [**⚡ Quick Start**](#-quick-start) &nbsp;·&nbsp;
 [**✨ Features**](#-features) &nbsp;·&nbsp;
 [**🏗️ Architecture**](#️-architecture) &nbsp;·&nbsp;
@@ -306,7 +306,7 @@ OPENAI_API_KEY=sk-...
 # OLLAMA_BASE_URL=http://localhost:11434
 
 # Optional hardening: only accept requests from your deployed site
-NEXMIND_CORS_ORIGINS=https://nexmind-three.vercel.app
+NEXMIND_CORS_ORIGINS=https://nexmind-livid.vercel.app
 ```
 
 ### 4️⃣ Develop the web app (hot reload)
@@ -325,41 +325,85 @@ Open **http://localhost:5173**. The page finds the backend by itself.
 
 ## 🚀 Deploy to Vercel
 
-The web app is a static site, so there is nothing to configure beyond the folder.
+The whole product (web app **and** API) deploys as **one Vercel project** from the repository root. The API runs as a Python function (`api/index.py`); the web app is served as static files.
 
-1. Push the project to GitHub.
-2. In Vercel, choose **Add New → Project** and import the repo.
-3. Set **Root Directory to `frontend`** ⚠️ (important). Framework Preset: **Vite** (auto-detected).
-   Build Command `npm run build` and Output Directory `dist` are already set in `frontend/vercel.json`.
-4. Deploy. No environment variables are required; Node 20 or 22 both work.
+```mermaid
+flowchart LR
+    B["🌐 Browser"] -->|"/  /app/*"| S["Static web app<br/>frontend/dist"]
+    B -->|"/api/*  /connect.py"| F["🐍 Python function<br/>api/index.py → FastAPI"]
+    F --> DB[("🐘 Postgres (Neon)<br/>workspaces · graphs · files · chats · events")]
+    F --> GH["GitHub / GitLab / Azure<br/>HTTPS archive download"]
+    F --> AI{{"OpenAI"}}
+    V["💻 VS Code terminal<br/>connect command"] -->|"zip + chunked upload"| F
+```
 
-> [!TIP]
-> `vercel.json` rewrites every path to `index.html`, so refreshing a deep link like `/app/w/...` never returns a 404.
+### One-time setup
+
+| Step | Where | What to do |
+| :--- | :--- | :--- |
+| 1 | Vercel → Project → **Settings → General** | **Root Directory: `./`** (the repository root, **not** `frontend`). **Framework Preset: Other**. Leave build/output commands empty — `vercel.json` sets them. |
+| 2 | Vercel → **Storage** | **Create Database → Neon (Postgres)**, free plan, and **connect it to this project** (all environments). This adds `DATABASE_URL` automatically. |
+| 3 | Settings → **Environment Variables** | `OPENAI_API_KEY` = your key (optional: `NEXMIND_LLM_MODEL`, default `gpt-4o-mini`). |
+| 4 | Deployments | **Redeploy** (or push a commit). Open `https://<your-site>/api/health`: it must show `"hosted": true` and `"dialect": "postgres"` with `"setup_required": null`. |
 
 > [!IMPORTANT]
-> The hosted site shows the start command for your OS, then polls `http://127.0.0.1:8000/api/health` and continues the moment your local server answers. Your code and documents never leave your machine.
+> Without step 2 the app refuses to create workspaces and tells you to add the database: Vercel functions have no permanent disk, so anything else would silently lose your data.
 
-- Use **Chrome, Edge or Firefox**. Chrome may ask to allow access to devices on your local network: choose **Allow**.
-- Running on another port? Start with `nexmind serve --port 8001` and enter that address on the connect screen.
+### What changes on the hosted version
+
+| Feature | Hosted (Vercel) | On your computer (`nexmind serve`) |
+| :--- | :--- | :--- |
+| Storage | Postgres (files, graphs, chats) | SQLite + your disk |
+| Repo links | HTTPS archive download (public, or private with a token) | Same (falls back to `git`) |
+| Large uploads | Sent in 3.5 MB chunks (Vercel limit is 4.5 MB per request) | Same |
+| Live progress | Event feed + streamed build (no WebSockets on Vercel) | Same |
+| Local folder tab / folder browser | Hidden: a website cannot read your disk. Use **Upload project folder** or **Live connect** | Available |
+| Live connect | The command zips the folder, uploads it and re-uploads on every change | The server watches the folder in place |
+| Privacy | Each browser gets its own private key and sees only its own workspaces | Single user |
+
+### Live connect from VS Code (hosted)
+
+Open your project in VS Code, open the terminal (<kbd>Ctrl</kbd> + <kbd>`</kbd>) and paste the command shown in **New workspace → Live connect**. It looks like:
+
+```powershell
+irm "https://<your-site>/connect.py?k=<your-browser-key>" | python - .
+```
+
+It needs only Python 3.8+. Keep the terminal open for live sync (<kbd>Ctrl</kbd>+<kbd>C</kbd> stops it); add `--no-watch` to index once.
+
+### Limits (hosted)
+
+- Uploads: 120 MB per file (`NEXMIND_MAX_UPLOAD_MB`), 30 workspaces per browser (`NEXMIND_MAX_WORKSPACES`).
+- One graph build may take up to 300 s (Vercel Hobby maximum). Very large repositories: index a sub-folder such as `src`.
+- Live connect uploads source files up to 2 MB each and 100 MB in total, skipping `node_modules`, `.git`, build output and binaries.
 
 <img src="assets/divider.svg" width="100%" alt=""/>
 
 ## 🧪 Testing
 
 ```powershell
-# Backend: 19 tests
-cd backend ; pip install -e ".[dev]" ; python -m pytest tests -q
+# Backend, local mode (SQLite, background jobs)
+cd backend
+pip install -r requirements-dev.txt
+python -m pytest tests -q
 
-# Frontend: types, production build, UI tests
-cd frontend ; npm run typecheck ; npm run build ; npm test
+# Backend, hosted mode exactly as on Vercel (embedded Postgres, no background threads, per-browser isolation)
+python -m pytest tests_hosted -q
+
+# Frontend: types, unit/UI tests, production build
+cd ..\frontend
+npm ci
+npm run typecheck
+npm test
+npm run build
 ```
 
-`npm test` also runs a full **UI-against-live-server** test when the backend is running and these are set:
+Optional full-stack check of the real frontend modules against any running hosted deployment:
 
-| Variable | Value |
-| :--- | :--- |
-| `NEXMIND_TEST_SAMPLE` | Path of a folder to analyze |
-| `NEXMIND_TEST_API` | Address of the running backend |
+```powershell
+$env:NEXMIND_LIVE_API = "https://<your-site>"
+npx vitest run src/__tests__/hosted.live.test.ts
+```
 
 ## 🛠️ Troubleshooting
 
@@ -393,7 +437,19 @@ Run `nexmind serve --port 8001`, then enter `http://127.0.0.1:8001` on the conne
 <details>
 <summary><b>📦 Importing a repo link fails</b></summary>
 
-Git is required for GitHub / GitLab / Azure DevOps imports. Run `nexmind doctor` to confirm it is installed, and provide an access token for private repositories.
+Repositories are downloaded over HTTPS (no `git` needed). "Not found, or it is private" means the URL or branch is wrong, or the repository needs an access token with read access.
+</details>
+
+<details>
+<summary><b>☁️ Vercel: "Storage is not set up yet"</b></summary>
+
+Add a Postgres database in **Vercel → Storage** (Neon, free), connect it to the project for all environments, then redeploy. Check `https://<your-site>/api/health`.
+</details>
+
+<details>
+<summary><b>☁️ Vercel: the site loads but every action fails</b></summary>
+
+Open `https://<your-site>/api/health`. A 404 means the Root Directory is still `frontend`: set it to `./` and Framework Preset to **Other**, then redeploy. Function logs are under **Deployments → (latest) → Functions**.
 </details>
 
 <img src="assets/divider.svg" width="100%" alt=""/>

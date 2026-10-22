@@ -1,21 +1,33 @@
-"""Workspaces (isolated project spaces), uploads / git ingestion, sources and jobs."""
+"""Workspaces, sources, uploads (chunked, Vercel-safe), repository downloads and jobs."""
 from __future__ import annotations
 
+import mimetypes
+import os
 import re
 import shutil
+import tempfile
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Literal
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from ..config import settings
 from ..db import dumps, loads, new_id, now
-from ..ingest.files import ARCHIVE_EXT, IngestError, collapse_single_root, git_clone, safe_extract_tar, safe_extract_zip, validate_git_url
-from ..state import db, jobs, store
+from ..ingest.files import ARCHIVE_EXT, IngestError, collapse_single_root, safe_extract_tar, safe_extract_zip, validate_git_url
+from ..ingest.remote import fetch_repository
+from ..owner import can_access, current_owner, isolated
+from ..state import db, events, files, jobs, store
+from ..storage import read_source_file
 
 router = APIRouter(prefix="/api", tags=["workspaces"])
+
+DOCS_ONLY_MSG = "Document workspaces take PDFs, Word, Markdown, text and zip files."
+LIVE_MSG = "Live workspaces are connected from a folder with the Live connect command."
+CODE_PDF_MSG = "Project workspaces take repositories or project archives. Use a Documents workspace for PDFs."
+LOCAL_ONLY_MSG = ("Folders on your computer can only be opened by a NexMind server running on your computer. "
+                  "In the hosted app, use 'Upload a project folder' or the Live connect command.")
 
 
 class WorkspaceIn(BaseModel):
@@ -44,8 +56,30 @@ class FsPickIn(BaseModel):
     initial: str | None = None
 
 
-def ws_dir(ws_id: str) -> Path:
-    return settings.workspaces_dir / ws_id
+class UploadInit(BaseModel):
+    name: str = Field(min_length=1, max_length=300)
+    size: int = Field(ge=0)
+    chunk_size: int | None = Field(default=None, ge=65536)  # optional smaller chunks (slow networks)
+
+
+class UploadsIngest(BaseModel):
+    upload_ids: list[str] = Field(min_length=1, max_length=200)
+    name: str | None = Field(default=None, max_length=120)
+
+
+# ----------------------------------------------------------------------------- helpers
+
+def require_storage() -> None:
+    """A hosted deployment without a database would silently lose every workspace."""
+    if settings.hosted and not db.persistent and os.environ.get("NEXMIND_ALLOW_EPHEMERAL") != "1":
+        raise HTTPException(503, "Storage is not set up yet. In Vercel open Storage, add a Postgres database (Neon), "
+                                 "connect it to this project, then redeploy.")
+
+
+def require_key() -> str | None:
+    if isolated() and not current_owner():
+        raise HTTPException(401, "This browser has no NexMind key yet. Reload the page and try again.")
+    return current_owner()
 
 
 def infer_kind(ws: dict) -> str:
@@ -60,7 +94,7 @@ def infer_kind(ws: dict) -> str:
 
 def get_ws(ws_id: str) -> dict:
     ws = db.one("SELECT * FROM workspaces WHERE id=?", (ws_id,))
-    if not ws:
+    if not ws or not can_access(ws.get("owner")):
         raise HTTPException(404, "Workspace not found")
     if not ws.get("kind"):
         ws["kind"] = infer_kind(ws)
@@ -77,24 +111,146 @@ def _ws_out(ws: dict) -> dict:
     }
 
 
+def create_workspace_row(name: str, kind: str, description: str = "") -> str:
+    require_storage()
+    owner = require_key()
+    if isolated():
+        n = db.one("SELECT COUNT(*) AS n FROM workspaces WHERE owner=?", (owner,))
+        if n and n["n"] >= settings.max_workspaces_per_owner:
+            raise HTTPException(429, f"You already have {settings.max_workspaces_per_owner} workspaces. Delete one to create another.")
+    ws_id = new_id("ws_")
+    t = now()
+    db.execute(
+        "INSERT INTO workspaces(id,name,description,created_at,updated_at,status,stats,kind,owner) VALUES(?,?,?,?,?,?,?,?,?)",
+        (ws_id, name, description, t, t, "empty", "{}", kind, owner),
+    )
+    return ws_id
+
+
+def _tmpdir(prefix: str) -> Path:
+    base = settings.data_dir / "tmp"
+    base.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=prefix, dir=str(base)))
+
+
+def _safe_name(name: str) -> str:
+    base = Path(name.replace("\\", "/")).name
+    base = re.sub(r"[^A-Za-z0-9._\- ()]", "_", base).strip(" .") or "file"
+    return base[:150]
+
+
+def _safe_rel(name: str) -> str:
+    """Keep folder structure of uploaded folders (webkitRelativePath) but never allow escaping."""
+    parts = [p for p in name.replace("\\", "/").split("/") if p not in ("", ".", "..")]
+    return "/".join(_safe_name(p) for p in parts) or "file"
+
+
+def _is_archive(name: str) -> bool:
+    return name.lower().endswith(ARCHIVE_EXT)
+
+
+def add_tree_source(ws_id: str, name: str, kind: str, origin: str, root: Path, source_id: str | None = None) -> str:
+    """Store every supported file of `root` in the database as one source of the workspace."""
+    sid = source_id or new_id("src_")
+    exists = db.one("SELECT id FROM sources WHERE id=?", (sid,))
+    if not exists:
+        db.execute(
+            "INSERT INTO sources(id,workspace_id,name,kind,origin,path,size,file_count,created_at,watch,stored) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (sid, ws_id, name, kind, origin, "", 0, 0, now(), 0, 1),
+        )
+    count, total = files.store_tree(ws_id, sid, root)
+    if count == 0:
+        if not exists:
+            db.execute("DELETE FROM sources WHERE id=?", (sid,))
+        raise IngestError(f"No supported files were found in {name}.")
+    db.execute("UPDATE sources SET file_count=?, size=?, stored=1, path='' WHERE id=?", (count, total, sid))
+    return sid
+
+
+def ingest_archive_file(ws_id: str, archive: Path, display_name: str) -> str:
+    out = _tmpdir("nexmind-x-")
+    try:
+        try:
+            if display_name.lower().endswith(".zip"):
+                safe_extract_zip(archive, out)
+            else:
+                safe_extract_tar(archive, out)
+        except IngestError:
+            raise
+        except Exception as e:
+            raise IngestError(f"Could not open {display_name}: {e}") from e
+        root = collapse_single_root(out)
+        label = re.sub(r"(\.tar\.gz|\.tar\.bz2|\.tgz|\.zip|\.tar)$", "", display_name, flags=re.I)
+        return add_tree_source(ws_id, label, "archive", display_name, root)
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def check_upload_allowed(ws: dict, names: list[str]) -> None:
+    kind = ws.get("kind")
+    if kind == "live":
+        raise HTTPException(400, LIVE_MSG)
+    if kind == "code" and names and all(Path(n).suffix.lower() in {".pdf", ".docx"} for n in names):
+        raise HTTPException(400, CODE_PDF_MSG)
+
+
+def ingest_paths(ws: dict, items: list[tuple[str, Path]], label: str | None = None) -> list[str]:
+    """items = [(original name incl. relative folder, file on disk)]. Archives become their own sources."""
+    ws_id = ws["id"]
+    check_upload_allowed(ws, [n for n, _ in items])
+    source_ids: list[str] = []
+    loose = [(n, p) for n, p in items if not _is_archive(n)]
+    for n, p in items:
+        if _is_archive(n):
+            source_ids.append(ingest_archive_file(ws_id, p, _safe_name(n)))
+    if loose:
+        stage = _tmpdir("nexmind-u-")
+        try:
+            used: set[str] = set()
+            for n, p in loose:
+                rel = _safe_rel(n)
+                k = 1
+                base_rel = rel
+                while rel in used:
+                    stem, dot, ext = base_rel.rpartition(".")
+                    rel = f"{stem}_{k}{dot}{ext}" if dot else f"{base_rel}_{k}"
+                    k += 1
+                used.add(rel)
+                target = stage / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(p, target)
+            name = label or (loose[0][0].replace("\\", "/").split("/")[0] if "/" in loose[0][0].replace("\\", "/") else (loose[0][0] if len(loose) == 1 else f"{len(loose)} uploaded files"))
+            source_ids.append(add_tree_source(ws_id, name, "files", "upload", collapse_single_root(stage) if len(loose) > 1 else stage))
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+    return source_ids
+
+
+def _ingest_error(e: IngestError) -> HTTPException:
+    return HTTPException(400, str(e))
+
+
+# ----------------------------------------------------------------------------- workspaces
+
 @router.post("/workspaces", status_code=201)
 def create_workspace(body: WorkspaceIn) -> dict:
     name = body.name.strip()
     if not name:
         raise HTTPException(422, "Workspace name cannot be empty")
-    ws_id = new_id("ws_")
-    t = now()
-    db.execute(
-        "INSERT INTO workspaces(id,name,description,created_at,updated_at,status,stats,kind) VALUES(?,?,?,?,?,?,?,?)",
-        (ws_id, name, body.description.strip(), t, t, "empty", "{}", body.kind),
-    )
-    ws_dir(ws_id).mkdir(parents=True, exist_ok=True)
+    ws_id = create_workspace_row(name, body.kind, body.description.strip())
     return _ws_out(get_ws(ws_id))
 
 
 @router.get("/workspaces")
 def list_workspaces() -> list[dict]:
-    return [_ws_out(w) for w in db.query("SELECT * FROM workspaces ORDER BY updated_at DESC")]
+    if isolated():
+        owner = current_owner()
+        if not owner:
+            return []
+        rows = db.query("SELECT * FROM workspaces WHERE owner=? ORDER BY updated_at DESC", (owner,))
+    else:
+        rows = db.query("SELECT * FROM workspaces ORDER BY updated_at DESC")
+    return [_ws_out(w) for w in rows]
 
 
 @router.get("/workspaces/{ws_id}")
@@ -119,12 +275,16 @@ def patch_workspace(ws_id: str, body: WorkspacePatch) -> dict:
 def delete_workspace(ws_id: str) -> None:
     get_ws(ws_id)
     store.clear(ws_id)
-    with db.tx() as c:
+    files.delete_workspace(ws_id)
+    events.delete_workspace(ws_id)
+
+    def tx(c):
         c.execute("DELETE FROM messages WHERE thread_id IN (SELECT id FROM threads WHERE workspace_id=?)", (ws_id,))
-        for t in ("threads", "jobs", "sources", "insights"):
+        for t in ("threads", "jobs", "sources", "connect_sessions"):
             c.execute(f"DELETE FROM {t} WHERE workspace_id=?", (ws_id,))
         c.execute("DELETE FROM workspaces WHERE id=?", (ws_id,))
-    shutil.rmtree(ws_dir(ws_id), ignore_errors=True)
+    db.run(tx)
+    shutil.rmtree(settings.workspaces_dir / ws_id, ignore_errors=True)  # legacy local copies only
 
 
 # ----------------------------------------------------------------------------- sources
@@ -141,194 +301,183 @@ def delete_source(ws_id: str, source_id: str) -> dict:
     src = db.one("SELECT * FROM sources WHERE id=? AND workspace_id=?", (source_id, ws_id))
     if not src:
         raise HTTPException(404, "Source not found")
+    files.delete_source(source_id)  # a folder connected in place on disk is never touched
     db.execute("DELETE FROM sources WHERE id=?", (source_id,))
-    shutil.rmtree(ws_dir(ws_id) / "sources" / source_id, ignore_errors=True)
-    job = jobs.submit(ws_id, "rebuild")
-    return {"job_id": job}
+    shutil.rmtree(settings.workspaces_dir / ws_id / "sources" / source_id, ignore_errors=True)
+    return {"job_id": jobs.submit(ws_id, "rebuild")}
 
 
 @router.get("/workspaces/{ws_id}/sources/{source_id}/raw")
 def raw_file(ws_id: str, source_id: str, path: str):
-    """Serve an original uploaded file (e.g. to render a PDF page next to a node)."""
+    """Serve an original file (e.g. to show a PDF next to a node)."""
     get_ws(ws_id)
-    src = db.one("SELECT * FROM sources WHERE id=? AND workspace_id=?", (source_id, ws_id))
-    if not src:
+    if not db.one("SELECT 1 AS x FROM sources WHERE id=? AND workspace_id=?", (source_id, ws_id)):
         raise HTTPException(404, "Source not found")
-    root = Path(src["path"]).resolve()
-    target = (root / path).resolve()
-    if root not in target.parents or not target.is_file():
+    data = read_source_file(db, files, source_id, path)
+    if data is None:
         raise HTTPException(404, "File not found")
-    return FileResponse(target)
+    media = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    return Response(data, media_type=media, headers={"Content-Disposition": f'inline; filename="{_safe_name(path)}"'})
 
 
-# ----------------------------------------------------------------------------- ingestion
+# ----------------------------------------------------------------------------- chunked uploads (Vercel limits one request to 4.5 MB)
 
-def _safe_name(name: str) -> str:
-    base = Path(name.replace("\\", "/")).name
-    base = re.sub(r"[^A-Za-z0-9._\- ()]", "_", base).strip(" .") or "file"
-    return base[:150]
+def _chunk_bytes() -> int:
+    return int(settings.upload_chunk_mb * 1024 * 1024)
 
 
-def _is_archive(name: str) -> bool:
-    return name.lower().endswith(ARCHIVE_EXT)
+@router.post("/uploads", status_code=201)
+def upload_init(body: UploadInit) -> dict:
+    require_storage()
+    owner = require_key()
+    if body.size > settings.max_upload_mb * 1024 * 1024:
+        raise HTTPException(413, f"'{body.name}' is larger than the {settings.max_upload_mb} MB limit")
+    uid = new_id("up_")
+    size = min(body.chunk_size or _chunk_bytes(), _chunk_bytes())
+    chunks = max(1, -(-body.size // size))
+    db.execute("INSERT INTO uploads(id, owner, name, size, received, chunks, created_at) VALUES(?,?,?,?,?,?,?)",
+               (uid, owner, body.name, body.size, size, chunks, now()))
+    # forget abandoned uploads after a day
+    old = [r["id"] for r in db.query("SELECT id FROM uploads WHERE created_at<?", (now() - 86400,))]
+    for o in old:
+        db.execute("DELETE FROM upload_chunks WHERE upload_id=?", (o,))
+        db.execute("DELETE FROM uploads WHERE id=?", (o,))
+    return {"upload_id": uid, "chunk_size": size, "chunks": chunks}
 
 
-async def _save_upload(up: UploadFile, dest: Path) -> int:
-    limit = settings.max_upload_mb * 1024 * 1024
-    size = 0
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with open(dest, "wb") as out:
-        while True:
-            chunk = await up.read(1024 * 1024)
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > limit:
-                out.close()
-                dest.unlink(missing_ok=True)
-                raise HTTPException(413, f"'{up.filename}' exceeds the {settings.max_upload_mb} MB upload limit")
-            out.write(chunk)
-    return size
+def _upload_row(uid: str) -> dict:
+    up = db.one("SELECT * FROM uploads WHERE id=?", (uid,))
+    if not up or not can_access(up.get("owner")):
+        raise HTTPException(404, "Upload not found")
+    return up
 
 
-def _register_source(ws_id: str, source_id: str, name: str, kind: str, origin: str, path: Path, size: int = 0, watch: int = 0) -> None:
-    db.execute(
-        "INSERT INTO sources(id,workspace_id,name,kind,origin,path,size,file_count,created_at,watch) VALUES(?,?,?,?,?,?,?,?,?,?)",
-        (source_id, ws_id, name, kind, origin, str(path), size, 0, now(), watch),
-    )
+@router.put("/uploads/{uid}/chunks/{idx}")
+async def upload_chunk(uid: str, idx: int, request: Request) -> dict:
+    up = _upload_row(uid)
+    if idx < 0 or idx >= up["chunks"]:
+        raise HTTPException(400, "Chunk index out of range")
+    data = await request.body()
+    if len(data) > int(up["received"] or _chunk_bytes()) + 1024:
+        raise HTTPException(413, "Chunk too large")
+    db.execute("DELETE FROM upload_chunks WHERE upload_id=? AND idx=?", (uid, idx))
+    db.execute("INSERT INTO upload_chunks(upload_id, idx, data) VALUES(?,?,?)", (uid, idx, data))
+    got = db.one("SELECT COUNT(*) AS n FROM upload_chunks WHERE upload_id=?", (uid,))
+    return {"upload_id": uid, "received_chunks": got["n"] if got else 0, "chunks": up["chunks"]}
 
 
-def _drop_source(ws_id: str, source_id: str) -> None:
-    db.execute("DELETE FROM sources WHERE id=?", (source_id,))
-    shutil.rmtree(ws_dir(ws_id) / "sources" / source_id, ignore_errors=True)
-    shutil.rmtree(ws_dir(ws_id) / "uploads" / source_id, ignore_errors=True)
+def assemble_upload(uid: str, dest_dir: Path) -> tuple[str, Path]:
+    up = _upload_row(uid)
+    rows = db.query("SELECT idx, data FROM upload_chunks WHERE upload_id=? ORDER BY idx", (uid,))
+    if len(rows) != up["chunks"] or [r["idx"] for r in rows] != list(range(up["chunks"])):
+        raise HTTPException(400, f"Upload of '{up['name']}' is incomplete. Please try again.")
+    target = dest_dir / new_id("f_")
+    with open(target, "wb") as out:
+        for r in rows:
+            out.write(bytes(r["data"]))
+    if target.stat().st_size != up["size"]:
+        raise HTTPException(400, f"Upload of '{up['name']}' arrived damaged. Please try again.")
+    return up["name"], target
 
 
-def _extract_step(ws_id: str, source_id: str, archive: Path, dest: Path) -> Callable:
-    def step(emit) -> None:
-        emit("progress", phase="extract", percent=2, message=f"Extracting {archive.name}…")
+def discard_uploads(uids: list[str]) -> None:
+    for uid in uids:
+        db.execute("DELETE FROM upload_chunks WHERE upload_id=?", (uid,))
+        db.execute("DELETE FROM uploads WHERE id=?", (uid,))
+
+
+@router.post("/workspaces/{ws_id}/ingest/uploads", status_code=202)
+def ingest_uploads(ws_id: str, body: UploadsIngest) -> dict:
+    ws = get_ws(ws_id)
+    require_storage()
+    stage = _tmpdir("nexmind-a-")
+    try:
+        items = [assemble_upload(uid, stage) for uid in body.upload_ids]
         try:
-            n = safe_extract_zip(archive, dest) if archive.name.lower().endswith(".zip") else safe_extract_tar(archive, dest)
-            root = collapse_single_root(dest)
-            db.execute("UPDATE sources SET path=?, file_count=? WHERE id=?", (str(root), n, source_id))
-            emit("log", level="info", message=f"Extracted {n} files from {archive.name}")
-        except Exception as e:
-            _drop_source(ws_id, source_id)
-            if isinstance(e, IngestError):
-                raise
-            raise IngestError(f"Could not extract {archive.name}: {e}") from e
-        finally:
-            shutil.rmtree(archive.parent, ignore_errors=True)
-
-    return step
+            source_ids = ingest_paths(ws, items, label=body.name)
+        except IngestError as e:
+            raise _ingest_error(e) from e
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    discard_uploads(body.upload_ids)
+    return {"job_id": jobs.submit(ws_id, "ingest"), "source_ids": source_ids}
 
 
-def _clone_step(ws_id: str, source_id: str, url: str, branch: str | None, dest: Path, token: str | None = None) -> Callable:
-    def step(emit) -> None:
-        emit("progress", phase="clone", percent=2, message=f"Cloning {url}…")
-        try:
-            git_clone(url, dest, branch, token)
-            n = sum(1 for _ in dest.rglob("*") if _.is_file())
-            db.execute("UPDATE sources SET path=?, file_count=? WHERE id=?", (str(dest), n, source_id))
-            emit("log", level="info", message=f"Cloned {url} ({n} files)")
-        except Exception:
-            _drop_source(ws_id, source_id)
-            raise
-
-    return step
-
+# ----------------------------------------------------------------------------- ingestion (classic multipart, still used by small local uploads)
 
 @router.post("/workspaces/{ws_id}/ingest", status_code=202)
-async def ingest(ws_id: str, files: list[UploadFile] = File(default=[]), git_url: str | None = Form(default=None), branch: str | None = Form(default=None), git_token: str | None = Form(default=None)) -> dict:
-    """Upload PDFs / DOCX / Markdown / code files / .zip / .tar.gz archives and/or a public git URL.
-    The graph is (re)built in the background; subscribe to /ws/workspaces/{id} for live progress."""
+async def ingest(ws_id: str, files_in: list[UploadFile] = File(default=[], alias="files"), git_url: str | None = Form(default=None), branch: str | None = Form(default=None), git_token: str | None = Form(default=None)) -> dict:
     ws = get_ws(ws_id)
-    if ws.get("kind") == "live":
-        raise HTTPException(400, "Live workspaces are connected from a folder.")
-    if ws.get("kind") == "docs" and git_url:
-        raise HTTPException(400, "Document workspaces take PDFs, Word, Markdown, text and zip files.")
-    files = [f for f in files if f.filename]
-    if not files and not git_url:
+    require_storage()
+    uploads = [f for f in files_in if f.filename]
+    if not uploads and not git_url:
         raise HTTPException(400, "Provide at least one file or a git_url")
-    if ws.get("kind") == "code" and files and not git_url:
-        def _is_doc_only(name: str) -> bool:
-            return Path(name).suffix.lower() in {".pdf", ".docx"}
-        if all(_is_doc_only(f.filename or "") for f in files):
-            raise HTTPException(400, "Project workspaces take repositories or project archives. Use a Documents workspace for PDFs.")
-    prepare: list[Callable] = []
+    if git_url and ws.get("kind") == "docs":
+        raise HTTPException(400, DOCS_ONLY_MSG)
+    if git_url and ws.get("kind") == "live":
+        raise HTTPException(400, LIVE_MSG)
+    stage = _tmpdir("nexmind-m-")
     source_ids: list[str] = []
-    base = ws_dir(ws_id)
-
-    loose = [f for f in files if not _is_archive(f.filename or "")]
-    archives = [f for f in files if _is_archive(f.filename or "")]
-
-    for up in archives:
-        sid = new_id("src_")
-        name = _safe_name(up.filename or "archive")
-        arc_path = base / "uploads" / sid / name
-        size = await _save_upload(up, arc_path)
-        dest = base / "sources" / sid
-        _register_source(ws_id, sid, re.sub(r"(\.tar\.gz|\.tar\.bz2|\.tgz|\.zip|\.tar)$", "", name, flags=re.I), "archive", name, dest, size)
-        prepare.append(_extract_step(ws_id, sid, arc_path, dest))
-        source_ids.append(sid)
-
-    if loose:
-        sid = new_id("src_")
-        dest = base / "sources" / sid
+    try:
+        items: list[tuple[str, Path]] = []
+        limit = settings.max_upload_mb * 1024 * 1024
         total = 0
-        used: set[str] = set()
-        for up in loose:
-            name = _safe_name(up.filename or "file")
-            stem, dot, ext = name.rpartition(".")
-            k = 1
-            while name in used:
-                name = f"{stem or name}_{k}{dot}{ext}" if dot else f"{name}_{k}"
-                k += 1
-            used.add(name)
-            total += await _save_upload(up, dest / name)
-        label = loose[0].filename if len(loose) == 1 else f"{len(loose)} uploaded files"
-        _register_source(ws_id, sid, label or "Uploaded files", "files", "upload", dest, total)
-        db.execute("UPDATE sources SET file_count=? WHERE id=?", (len(loose), sid))
-        source_ids.append(sid)
-
-    if git_url:
+        for up in uploads:
+            target = stage / new_id("f_")
+            with open(target, "wb") as out:
+                while True:
+                    chunk = await up.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > limit:
+                        raise HTTPException(413, f"Uploads exceed the {settings.max_upload_mb} MB limit")
+                    out.write(chunk)
+            items.append((up.filename or "file", target))
         try:
-            url = validate_git_url(git_url)
+            if items:
+                source_ids += ingest_paths(ws, items)
+            if git_url:
+                source_ids.append(_ingest_repo(ws, git_url, branch, git_token))
         except IngestError as e:
-            raise HTTPException(400, str(e)) from e
-        sid = new_id("src_")
-        dest = base / "sources" / sid
-        label = url.rstrip("/").removesuffix(".git").split("/")[-1]
-        _register_source(ws_id, sid, label, "git", url, dest)
-        prepare.append(_clone_step(ws_id, sid, url, branch, dest, git_token))
-        source_ids.append(sid)
+            raise _ingest_error(e) from e
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    return {"job_id": jobs.submit(ws_id, "ingest"), "source_ids": source_ids}
 
-    job_id = jobs.submit(ws_id, "ingest", prepare)
-    return {"job_id": job_id, "source_ids": source_ids}
+
+def _ingest_repo(ws: dict, url: str, branch: str | None, token: str | None) -> str:
+    url = validate_git_url(url)
+    dl = _tmpdir("nexmind-g-")
+    try:
+        root = fetch_repository(url, dl / "work", branch, token)
+        label = url.rstrip("/").removesuffix(".git").split("/")[-1]
+        return add_tree_source(ws["id"], label, "git", url, root)
+    finally:
+        shutil.rmtree(dl, ignore_errors=True)
 
 
 @router.post("/workspaces/{ws_id}/ingest/git", status_code=202)
 def ingest_git(ws_id: str, body: GitIn) -> dict:
     ws = get_ws(ws_id)
+    require_storage()
     if ws.get("kind") == "live":
-        raise HTTPException(400, "Live workspaces are connected from a folder.")
+        raise HTTPException(400, LIVE_MSG)
     if ws.get("kind") == "docs":
-        raise HTTPException(400, "Document workspaces take PDFs, Word, Markdown, text and zip files.")
+        raise HTTPException(400, DOCS_ONLY_MSG)
+    if body.branch and not re.match(r"^[A-Za-z0-9_.\-/]+$", body.branch.strip()):
+        raise HTTPException(400, "Invalid branch name")
     try:
-        url = validate_git_url(body.url)
+        sid = _ingest_repo(ws, body.url, body.branch, body.token)
     except IngestError as e:
-        raise HTTPException(400, str(e)) from e
-    sid = new_id("src_")
-    dest = ws_dir(ws_id) / "sources" / sid
-    _register_source(ws_id, sid, url.rstrip("/").removesuffix(".git").split("/")[-1], "git", url, dest)
-    job_id = jobs.submit(ws_id, "ingest", [_clone_step(ws_id, sid, url, body.branch, dest, body.token)])
-    return {"job_id": job_id, "source_ids": [sid]}
+        raise _ingest_error(e) from e
+    return {"job_id": jobs.submit(ws_id, "ingest"), "source_ids": [sid]}
 
 
 def require_local(request: Request) -> None:
     host = request.client.host if request.client else ""
     if not settings.allow_local_paths:
-        raise HTTPException(403, "Local folder access is disabled (NEXMIND_ALLOW_LOCAL_PATHS=false)")
+        raise HTTPException(403, LOCAL_ONLY_MSG)
     if host not in ("127.0.0.1", "::1", "localhost", "testclient"):
         raise HTTPException(403, "Local folder access is only available from the machine running NexMind")
 
@@ -338,7 +487,7 @@ def ingest_local(ws_id: str, body: LocalIn, request: Request) -> dict:
     """Index a folder that already exists on this machine, in place (nothing is copied or modified)."""
     ws = get_ws(ws_id)
     if ws.get("kind") == "docs":
-        raise HTTPException(400, "Document workspaces take PDFs, Word, Markdown, text and zip files.")
+        raise HTTPException(400, DOCS_ONLY_MSG)
     require_local(request)
     p = Path(body.path.strip().strip('"')).expanduser()
     try:
@@ -350,9 +499,11 @@ def ingest_local(ws_id: str, body: LocalIn, request: Request) -> dict:
     if p == Path(p.anchor):
         raise HTTPException(400, "Choose a project folder, not a drive root")
     sid = new_id("src_")
-    _register_source(ws_id, sid, p.name or str(p), "local", str(p), p)
+    db.execute(
+        "INSERT INTO sources(id,workspace_id,name,kind,origin,path,size,file_count,created_at,watch,stored) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (sid, ws_id, p.name or str(p), "local", str(p), str(p), 0, 0, now(), 0, 0),
+    )
     return {"job_id": jobs.submit(ws_id, "ingest"), "source_ids": [sid]}
-
 
 @router.get("/fs/list", tags=["system"])
 def fs_list(request: Request, path: str | None = None, files: int = 1) -> dict:
@@ -653,6 +804,7 @@ def fs_check(request: Request, path: str | None = None) -> dict:
     }
 
 
+
 @router.post("/workspaces/{ws_id}/rebuild", status_code=202)
 def rebuild(ws_id: str) -> dict:
     get_ws(ws_id)
@@ -665,12 +817,17 @@ def _job_out(j: dict) -> dict:
     return {**{k: j[k] for k in ("id", "workspace_id", "kind", "status", "progress", "phase", "message", "error", "created_at", "updated_at")}, "result": loads(j["result"], None)}
 
 
-@router.get("/jobs/{job_id}")
-def read_job(job_id: str) -> dict:
+def get_job(job_id: str) -> dict:
     j = db.one("SELECT * FROM jobs WHERE id=?", (job_id,))
     if not j:
         raise HTTPException(404, "Job not found")
-    return _job_out(j)
+    get_ws(j["workspace_id"])  # ownership
+    return j
+
+
+@router.get("/jobs/{job_id}")
+def read_job(job_id: str) -> dict:
+    return _job_out(get_job(job_id))
 
 
 @router.get("/workspaces/{ws_id}/jobs")

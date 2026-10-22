@@ -79,6 +79,8 @@ function formatBytes(bytes: number): string {
 
 export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
   const { status } = useServer()
+  // A hosted NexMind (e.g. Vercel) cannot open folders on your computer: upload the folder instead.
+  const localOk = useServer((st) => st.health?.capabilities?.local_paths ?? true)
   const isOnline = status === 'online'
 
   const [tab, setTab] = useState<Tab>('github')
@@ -291,7 +293,7 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
 
       {/* Tabs */}
       <div role="tablist" aria-label="Project source" className="flex flex-wrap gap-1">
-        {TABS.map((t) => {
+        {TABS.filter((t) => t.id !== 'local' || localOk).map((t) => {
           const Icon = t.icon
           const isSelected = tab === t.id
           return (

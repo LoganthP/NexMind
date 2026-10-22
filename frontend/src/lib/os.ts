@@ -1,3 +1,4 @@
+import { getApiBase, getBrowserKey } from './api'
 export type OS = 'windows' | 'mac' | 'linux'
 export function detectOS(): OS {
   const ua = (navigator.userAgent || '').toLowerCase()
@@ -22,9 +23,12 @@ export const PIP_COMMAND = 'pip install -e . ; nexmind serve'
  *   2. Fallback to http://127.0.0.1:8000
  */
 export function getBackendBase(): string {
-  // import.meta.env is replaced at build time by Vite
-  const envUrl = typeof import.meta !== 'undefined' ? (import.meta as any).env?.VITE_API_URL : undefined
-  return (envUrl || 'http://127.0.0.1:8000').replace(/\/$/, '')
+  return getApiBase().replace(/\/$/, '')
+}
+
+/** The connect script URL carries this browser's key so the folder appears in this browser's workspaces. */
+export function connectScriptUrl(base?: string): string {
+  return `${(base || getBackendBase()).replace(/\/+$/, '')}/connect.py?k=${encodeURIComponent(getBrowserKey())}`
 }
 
 /**
@@ -38,16 +42,16 @@ export function getBackendBase(): string {
  */
 export function getUniversalConnectCommands(os: OS, base?: string): { primary: string; alt: string } {
   const backendBase = (base || getBackendBase()).replace(/\/$/, '')
-  const scriptUrl = `${backendBase}/connect.py`
+  const scriptUrl = connectScriptUrl(backendBase)
 
   if (os === 'windows') {
     return {
-      primary: `irm ${scriptUrl} | python - .`,
+      primary: `irm "${scriptUrl}" | python - .`,
       alt: `& python -m nexmind connect .`,
     }
   }
   return {
-    primary: `curl -fsSL ${scriptUrl} | python3 - .`,
+    primary: `curl -fsSL "${scriptUrl}" | python3 - .`,
     alt: `python3 -m nexmind connect .`,
   }
 }

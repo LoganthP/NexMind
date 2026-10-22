@@ -3,18 +3,51 @@ import type {
   Retrieval, SearchResult, SourceItem, Thread, TraceResult, TreeNode, Workspace, Citation,
 } from './types'
 
-const KEY = 'nexmind.api'
+const KEY = 'nexmind.api.v2' // v1 stored http://127.0.0.1:8000 on hosted sites; ignored from now on
+const BROWSER_KEY = 'nexmind.key'
 export const DEFAULT_API = 'http://127.0.0.1:8000'
+
+/** The backend lives on the same site when deployed (Vercel) or when the local server serves the app. */
+export function sameOriginBase(): string | null {
+  if (typeof window === 'undefined' || !window.location) return null
+  const { protocol, port, origin } = window.location
+  if (protocol !== 'http:' && protocol !== 'https:') return null
+  if (port === '5173' || port === '4173') return null // Vite dev / preview servers have no backend
+  return origin
+}
 
 export function getApiBase(): string {
   try {
-    return (localStorage.getItem(KEY) || (import.meta.env.VITE_API_URL as string | undefined) || DEFAULT_API).replace(/\/+$/, '')
+    const env = import.meta.env.VITE_API_URL as string | undefined
+    return (localStorage.getItem(KEY) || env || sameOriginBase() || DEFAULT_API).replace(/\/+$/, '')
   } catch {
-    return DEFAULT_API
+    return sameOriginBase() || DEFAULT_API
   }
 }
 export function setApiBase(url: string): void {
   try { localStorage.setItem(KEY, url.replace(/\/+$/, '')) } catch { /* private mode */ }
+}
+
+/** A random key per browser: on the hosted app each browser only sees its own workspaces. */
+export function getBrowserKey(): string {
+  try {
+    let k = localStorage.getItem(BROWSER_KEY)
+    if (!k || !/^[A-Za-z0-9_-]{16,64}$/.test(k)) {
+      const bytes = new Uint8Array(16)
+      crypto.getRandomValues(bytes)
+      k = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+      localStorage.setItem(BROWSER_KEY, k)
+    }
+    return k
+  } catch {
+    return 'nexmindanonymous0000'
+  }
+}
+export function authHeaders(): Record<string, string> {
+  return { 'X-NexMind-Key': getBrowserKey() }
+}
+function withKey(url: string): string {
+  return `${url}${url.includes('?') ? '&' : '?'}k=${encodeURIComponent(getBrowserKey())}`
 }
 export function wsBase(base = getApiBase()): string {
   return base.replace(/^http/, 'ws')
@@ -167,7 +200,7 @@ async function request<T>(path: string, init: RequestInit = {}, base = getApiBas
       init.signal.addEventListener('abort', abortListener, { once: true })
     }
     try {
-      const headers: Record<string, string> = { ...(init.headers as Record<string, string> | undefined) }
+      const headers: Record<string, string> = { ...authHeaders(), ...(init.headers as Record<string, string> | undefined) }
       // Keep GET requests "simple": no custom headers, no Content-Type on GETs to avoid extra preflights
       if (!isGet && init.body && typeof init.body === 'string') {
         headers['Content-Type'] = 'application/json'
@@ -253,7 +286,7 @@ export const api = {
   sourceTree: (id: string, sid: string) => request<TreeNode>(`/api/workspaces/${id}/sources/${sid}/tree`),
   rebuild: (id: string) => request<{ job_id: string }>(`/api/workspaces/${id}/rebuild`, { method: 'POST' }),
   ingestGit: (id: string, url: string, token?: string, branch?: string) =>
-    request<{ job_id: string }>(`/api/workspaces/${id}/ingest/git`, { method: 'POST', body: j({ url, token: token || undefined, branch: branch || undefined }) }),
+    request<{ job_id: string }>(`/api/workspaces/${id}/ingest/git`, { method: 'POST', body: j({ url, token: token || undefined, branch: branch || undefined }) }, getApiBase(), 300000),
   ingestLocal: (id: string, path: string) => request<{ job_id: string }>(`/api/workspaces/${id}/ingest/local`, { method: 'POST', body: j({ path }) }),
   fsList: (path?: string, files = 1) => request<FsListing>(`/api/fs/list${q({ path, files })}`),
   fsCheck: (path: string) => request<import('./types').FsCheckResult>(`/api/fs/check${q({ path })}`),
@@ -266,7 +299,7 @@ export const api = {
   setSourceWatch: (id: string, sid: string, enabled: boolean) =>
     request<{ ok: boolean; source_id: string; watch: number }>(`/api/workspaces/${id}/sources/${sid}/watch`, { method: 'POST', body: j({ enabled }) }),
   job: (id: string) => request<JobInfo>(`/api/jobs/${id}`),
-  rawUrl: (wsId: string, sid: string, path: string) => `${getApiBase()}/api/workspaces/${wsId}/sources/${sid}/raw${q({ path })}`,
+  rawUrl: (wsId: string, sid: string, path: string) => withKey(`${getApiBase()}/api/workspaces/${wsId}/sources/${sid}/raw${q({ path })}`),
 
   graph: (id: string, o: { types?: string; cluster?: number; max_nodes?: number; focus?: string; depth?: number } = {}, signal?: AbortSignal) =>
     request<GraphPayload>(`/api/workspaces/${id}/graph${q(o)}`, { signal }, getApiBase(), 120000),
@@ -310,7 +343,7 @@ export const api = {
   trace: (id: string, source: string, target: string) => request<TraceResult>(`/api/workspaces/${id}/trace${q({ source, target })}`),
   processes: (id: string, signal?: AbortSignal) => request<ProcessItem[]>(`/api/workspaces/${id}/processes`, { signal }),
   insights: (id: string, signal?: AbortSignal) => request<Insight[]>(`/api/workspaces/${id}/insights`, { signal }),
-  exportUrl: (id: string, format: 'json' | 'graphml' | 'cypher') => `${getApiBase()}/api/workspaces/${id}/export?format=${format}`,
+  exportUrl: (id: string, format: 'json' | 'graphml' | 'cypher') => withKey(`${getApiBase()}/api/workspaces/${id}/export?format=${format}`),
 
   threads: (id: string) => request<Thread[]>(`/api/workspaces/${id}/threads`),
   createThread: (id: string, title = 'New chat') => request<Thread>(`/api/workspaces/${id}/threads`, { method: 'POST', body: j({ title }) }),
@@ -320,23 +353,42 @@ export const api = {
 }
 
 /** Upload files with real progress (fetch cannot report upload progress). */
-export function uploadFiles(wsId: string, files: File[], onProgress: (pct: number) => void): Promise<{ job_id: string }> {
-  return new Promise((resolve, reject) => {
-    const form = new FormData()
-    files.forEach((f) => form.append('files', f, f.name))
-    const xhr = new XMLHttpRequest()
-    xhr.open('POST', `${getApiBase()}/api/workspaces/${wsId}/ingest`)
-    xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100)) }
-    xhr.onload = () => {
-      try {
-        const body = JSON.parse(xhr.responseText || '{}')
-        if (xhr.status >= 200 && xhr.status < 300) resolve(body)
-        else reject(new ApiError(typeof body.detail === 'string' ? body.detail : `Upload failed (${xhr.status})`, xhr.status))
-      } catch { reject(new ApiError(`Upload failed (${xhr.status})`, xhr.status)) }
+/** Upload files in chunks (each request stays under Vercel's 4.5 MB limit) with real progress. */
+export async function uploadFiles(wsId: string, files: File[], onProgress: (pct: number) => void): Promise<{ job_id: string }> {
+  const total = files.reduce((n, f) => n + f.size, 0) || 1
+  let sent = 0
+  const ids: string[] = []
+  for (const f of files) {
+    const name = ((f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name).slice(0, 300)
+    const init = await request<{ upload_id: string; chunk_size: number; chunks: number }>('/api/uploads', { method: 'POST', body: j({ name, size: f.size }) })
+    for (let i = 0; i < init.chunks; i++) {
+      const part = f.slice(i * init.chunk_size, (i + 1) * init.chunk_size)
+      let attempt = 0
+      for (;;) {
+        try {
+          const res = await fetch(`${getApiBase()}/api/uploads/${init.upload_id}/chunks/${i}`, { method: 'PUT', headers: { ...authHeaders(), 'Content-Type': 'application/octet-stream' }, body: part })
+          if (!res.ok) {
+            let detail = `Upload failed (${res.status})`
+            try { const d = await res.json(); if (typeof d.detail === 'string') detail = d.detail } catch { /* not json */ }
+            throw new ApiError(detail, res.status)
+          }
+          break
+        } catch (e) {
+          attempt += 1
+          if (attempt >= 3 || (e instanceof ApiError && e.status >= 400 && e.status < 500)) {
+            throw e instanceof ApiError ? e : new ApiError('Cannot reach the NexMind server. Is it running?')
+          }
+          await new Promise((r) => setTimeout(r, 600 * attempt))
+        }
+      }
+      sent += part.size
+      onProgress(Math.min(99, Math.round((sent / total) * 100)))
     }
-    xhr.onerror = () => reject(new ApiError('Cannot reach the NexMind server. Is it running?'))
-    xhr.send(form)
-  })
+    ids.push(init.upload_id)
+  }
+  const res = await request<{ job_id: string }>(`/api/workspaces/${wsId}/ingest/uploads`, { method: 'POST', body: j({ upload_ids: ids }) }, getApiBase(), 300000)
+  onProgress(100)
+  return res
 }
 
 export interface ChatHandlers {
@@ -352,7 +404,7 @@ export async function streamChat(wsId: string, tid: string, content: string, h: 
   let res: Response
   try {
     res = await fetch(`${getApiBase()}/api/workspaces/${wsId}/threads/${tid}/messages`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: j({ content, stream: true }), signal,
+      method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: j({ content, stream: true }), signal,
     })
   } catch (e) {
     if ((e as Error).name === 'AbortError') return

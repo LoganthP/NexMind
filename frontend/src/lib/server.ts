@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { DEFAULT_API, getApiBase, setApiBase } from './api'
+import { DEFAULT_API, getApiBase, sameOriginBase, setApiBase } from './api'
 import type { Health } from './types'
 
 export type ConnectionState =
@@ -75,7 +75,9 @@ export function supportsTargetAddressSpace(): boolean {
 
 export function getProbeCandidates(): string[] {
   const saved = getApiBase()
+  const same = sameOriginBase()
   const defaults = [
+    ...(same ? [same] : []),
     'http://127.0.0.1:8000',
     'http://localhost:8000',
     'http://127.0.0.1:8001',

@@ -15,7 +15,8 @@ from ..graph import analysis as A
 from ..graph.store import WorkspaceGraph
 from ..ingest.pipeline import _viz_edge, _viz_node
 from ..rag.index import deprioritize_tests, focus_snippet
-from ..state import db, store
+from ..state import db, events, files, store
+from ..storage import read_source_file
 from .workspaces import get_ws
 
 log = logging.getLogger("nexmind.graph_routes")
@@ -179,19 +180,10 @@ def summarize(wg: WorkspaceGraph, n: dict) -> str:
 
 
 def read_code(source_id: str | None, rel: str | None, start: int | None, end: int | None, max_lines: int = 400) -> dict | None:
-    if not source_id or not rel:
+    data = read_source_file(db, files, source_id, rel)
+    if data is None:
         return None
-    src = db.one("SELECT path FROM sources WHERE id=?", (source_id,))
-    if not src:
-        return None
-    root = Path(src["path"]).resolve()
-    target = (root / rel).resolve()
-    if root not in target.parents or not target.is_file():
-        return None
-    try:
-        lines = target.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except OSError:
-        return None
+    lines = data.decode("utf-8", errors="ignore").splitlines()
     s = max(1, start or 1)
     e = min(len(lines), end or (s + max_lines - 1), s + max_lines - 1)
     return {"path": rel, "start": s, "end": e, "total_lines": len(lines), "text": "\n".join(lines[s - 1 : e]), "truncated": (end or e) > e}
@@ -240,27 +232,25 @@ def check_etag(request: Request, ws: dict) -> tuple[str, bool]:
 
 @router.post("/relayout")
 def relayout(ws_id: str):
-    """Recompute 3D layout using the stored graph and updated cluster/anti-collision algorithms."""
-    from ..events import hub
+    """Recompute the 3D layout of the stored graph (no re-parsing)."""
+    import copy
 
     wg = wg_of(ws_id)
     assign = {nid: n.get("cluster", 0) for nid, n in wg.nodes.items()}
     U = A.build_undirected(wg.nodes, wg.edges)
     pos = A.layout_3d(U, assign, nodes=wg.nodes)
-    updates = [(x, y, z, ws_id, nid) for nid, (x, y, z) in pos.items()]
-    with db.tx() as c:
-        c.executemany("UPDATE nodes SET x=?, y=?, z=? WHERE workspace_id=? AND id=?", updates)
-        for pn in wg.nodes.values():
-            if pn["type"] == "Process":
-                steps = [pos[s["node_id"]] for s in pn["props"].get("steps", []) if s["node_id"] in pos]
-                if steps:
-                    px = round(sum(s[0] for s in steps) / len(steps), 2)
-                    py = round(sum(s[1] for s in steps) / len(steps), 2)
-                    pz = round(sum(s[2] for s in steps) / len(steps), 2)
-                    c.execute("UPDATE nodes SET x=?, y=?, z=? WHERE workspace_id=? AND id=?", (px, py, pz, ws_id, pn["id"]))
-    store.invalidate(ws_id)
-    hub.publish(ws_id, {"type": "relayout_done"})
-    return {"nodes": len(wg.nodes)}
+    nodes = copy.deepcopy(wg.nodes)
+    for nid, (x, y, z) in pos.items():
+        if nid in nodes:
+            nodes[nid].update(x=x, y=y, z=z)
+    for pn in nodes.values():
+        if pn["type"] == "Process":
+            steps = [pos[s["node_id"]] for s in pn["props"].get("steps", []) if s["node_id"] in pos]
+            if steps:
+                pn.update(x=round(sum(s[0] for s in steps) / len(steps), 2), y=round(sum(s[1] for s in steps) / len(steps), 2), z=round(sum(s[2] for s in steps) / len(steps), 2))
+    store.update_positions(ws_id, nodes)
+    events.add(ws_id, "relayout_done")
+    return {"nodes": len(nodes)}
 
 
 @router.get("/graph")

@@ -9,7 +9,6 @@ from fastapi.testclient import TestClient
 
 from nexmind.main import app
 from nexmind.state import db, store
-from nexmind.api.workspaces import ws_dir
 
 
 @pytest.fixture(scope="module")
@@ -145,8 +144,9 @@ def test_delete_workspace_cleanup_and_safety(client):
         assert db.one("SELECT * FROM threads WHERE workspace_id=?", (ws_id,)) is None
         assert db.one("SELECT * FROM jobs WHERE workspace_id=?", (ws_id,)) is None
 
-        # Verify workspace storage on disk is deleted
-        assert not ws_dir(ws_id).exists()
+        # Verify stored files and graph are deleted
+        assert db.one("SELECT 1 AS x FROM files WHERE workspace_id=?", (ws_id,)) is None
+        assert db.one("SELECT 1 AS x FROM graphs WHERE workspace_id=?", (ws_id,)) is None
 
         # CRITICAL SAFETY: The user's actual local folder was NEVER deleted
         assert temp_local.exists()

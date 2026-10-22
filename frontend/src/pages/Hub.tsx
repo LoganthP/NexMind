@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { motion } from 'framer-motion'
 import { BookOpen, Code2, FileText, FolderGit2, Plus, Settings2, Terminal, Trash2 } from 'lucide-react'
@@ -27,6 +27,8 @@ export default function Hub() {
   })
   const [menu, setMenu] = useState(false)
   const [connectOpen, setConnectOpen] = useState(false)
+  const menuRef = useRef<HTMLDivElement>(null)
+  const connectRef = useRef<HTMLDivElement>(null)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editName, setEditName] = useState('')
   const serverStatus = useServer((s) => s.status)
@@ -34,6 +36,30 @@ export default function Hub() {
   const isOnline = serverStatus === 'online'
   const isOffline = serverStatus === 'offline'
   const settings = useSettings()
+
+  useEffect(() => {
+    if (!menu && !connectOpen) return
+    const onMouseDown = (e: MouseEvent) => {
+      if (menu && menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenu(false)
+      }
+      if (connectOpen && connectRef.current && !connectRef.current.contains(e.target as Node)) {
+        setConnectOpen(false)
+      }
+    }
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setMenu(false)
+        setConnectOpen(false)
+      }
+    }
+    window.addEventListener('mousedown', onMouseDown)
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('mousedown', onMouseDown)
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [menu, connectOpen])
 
   const openDialog = (mode?: WorkspaceMode) => {
     setDialog({ open: true, mode: mode ?? null })
@@ -127,7 +153,7 @@ export default function Hub() {
   return (
     <div className="relative min-h-screen overflow-x-hidden bg-abyss">
       <Aurora />
-      <header className="relative z-10 mx-auto flex max-w-6xl items-center justify-between px-5 py-5">
+      <header className="relative z-30 mx-auto flex max-w-6xl items-center justify-between px-5 py-5">
         <Link to="/">
           <Logo />
         </Link>
@@ -138,7 +164,7 @@ export default function Hub() {
               {health?.llm.available ? health.llm.provider : 'offline answers'}
             </span>
           ) : (
-            <div className="relative">
+            <div className="relative" ref={connectRef}>
               <span className="chip border-coral/40 text-mist">
                 <i className="pulse-dot off !h-1.5 !w-1.5" /> Server not connected
                 <button
@@ -166,12 +192,18 @@ export default function Hub() {
               )}
             </div>
           )}
-          <div className="relative">
-            <button className="icon-btn" aria-label="Display settings" onClick={() => setMenu(!menu)}>
+          <div className="relative" ref={menuRef}>
+            <button
+              className={`icon-btn ${menu ? 'on' : ''}`}
+              aria-label="Display settings"
+              aria-expanded={menu}
+              title="Display settings"
+              onClick={() => setMenu(!menu)}
+            >
               <Settings2 size={18} />
             </button>
             {menu && (
-              <div className="glass absolute right-0 top-11 z-20 w-64 rounded-xl p-3">
+              <div className="glass absolute right-0 top-11 z-50 w-72 rounded-xl p-3 shadow-xl">
                 <Switch
                   label="Solid surfaces (no blur)"
                   checked={settings.solid}
@@ -182,6 +214,9 @@ export default function Hub() {
                   checked={settings.perf}
                   onChange={(v) => settings.set({ perf: v })}
                 />
+                <p className="mt-2 text-xs text-mist/70">
+                  Solid surfaces replace frosted glass with opaque, higher-contrast panels.
+                </p>
               </div>
             )}
           </div>
@@ -445,10 +480,6 @@ export default function Hub() {
           onClose={closeDialog}
         />
       )}
-
-      <footer className="relative z-10 pb-6 text-center text-xs text-mist/40 font-mono">
-        build {typeof __BUILD__ !== 'undefined' ? __BUILD__ : 'dev'}
-      </footer>
     </div>
   )
 }

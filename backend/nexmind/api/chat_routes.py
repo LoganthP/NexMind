@@ -75,7 +75,7 @@ def delete_thread(ws_id: str, tid: str) -> None:
 @router.get("/threads/{tid}/messages")
 def list_messages(ws_id: str, tid: str) -> list[dict]:
     _thread(ws_id, tid)
-    return [_msg_out(m) for m in db.query("SELECT * FROM messages WHERE thread_id=? ORDER BY created_at, rowid", (tid,))]
+    return [_msg_out(m) for m in db.query("SELECT * FROM messages WHERE thread_id=? ORDER BY created_at, CASE role WHEN 'user' THEN 0 ELSE 1 END", (tid,))]
 
 
 def _sse(event: str, data: dict) -> str:
@@ -88,7 +88,7 @@ async def post_message(ws_id: str, tid: str, body: MessageIn):
     `start` → `retrieval` (graph activation map + citations) → many `token` → `done` (answer, citations, follow-ups)."""
     th = _thread(ws_id, tid)
     ws = get_ws(ws_id)
-    history = [{"role": m["role"], "content": m["content"]} for m in db.query("SELECT role, content FROM messages WHERE thread_id=? ORDER BY created_at, rowid", (tid,))]
+    history = [{"role": m["role"], "content": m["content"]} for m in db.query("SELECT role, content FROM messages WHERE thread_id=? ORDER BY created_at, CASE role WHEN 'user' THEN 0 ELSE 1 END", (tid,))]
     user_id = new_id("msg_")
     t = now()
     db.execute("INSERT INTO messages(id,thread_id,role,content,meta,created_at) VALUES(?,?,?,?,?,?)", (user_id, tid, "user", body.content, "{}", t))

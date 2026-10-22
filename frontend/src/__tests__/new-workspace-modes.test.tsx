@@ -353,7 +353,8 @@ describe('Section 6: New Workspace Experience Tests', () => {
     )
 
     // Windows universal command: uses 127.0.0.1:8765, NEVER "&&"
-    const commandText = screen.getByText(/irm http:\/\/127\.0\.0\.1:8765\/connect\.py \| python - \./i)
+    fireEvent.click(screen.getByRole('tab', { name: 'Windows' }))
+    const commandText = screen.getByText(/irm "http:\/\/127\.0\.0\.1:8765\/connect\.py\?k=[A-Za-z0-9_-]+" \| python - \./i)
     expect(commandText).toBeTruthy()
     expect(commandText.textContent).not.toContain('&&')
 

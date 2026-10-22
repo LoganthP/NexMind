@@ -1,37 +1,42 @@
-"""NexMind — AI Repository & Document Intelligence backend (FastAPI)."""
+"""NexMind: AI repository & document intelligence backend (FastAPI).
+
+Runs the same code locally (`python -m nexmind serve`) and on Vercel (api/index.py imports `app`).
+"""
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
+import re
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import __version__
-from .api import chat_routes, graph_routes, workspaces, ws, connect, connect_script
+from .api import chat_routes, connect, connect_script, events as events_api, graph_routes, workspaces
 from .config import settings
-from .events import hub
 from .ingest.files import IngestError
+from .owner import OwnerMiddleware
 from .rag.llm import LLM, get_llm, set_llm
 from .state import db
 from .watcher import watcher
 
 logging.basicConfig(level=os.environ.get("NEXMIND_LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+log = logging.getLogger("nexmind")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    hub.bind_loop(asyncio.get_running_loop())
-    llm = get_llm()
-    watcher.start()
-    logging.getLogger("nexmind").info("NexMind %s ready — data dir: %s — LLM: %s", __version__, settings.data_dir, llm.info())
+    if settings.allow_local_paths and not settings.hosted:
+        watcher.start()
+    log.info("NexMind %s ready (%s, storage=%s, hosted=%s, LLM=%s)", __version__,
+             "vercel" if settings.on_vercel else "local", db.dialect, settings.hosted, get_llm().info().get("provider"))
     yield
     watcher.stop()
 
@@ -39,113 +44,28 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="NexMind API",
     version=__version__,
-    description="AI Repository & Document Intelligence — builds a live 3D knowledge graph from code and documents, with GraphRAG chat.",
+    description="AI Repository & Document Intelligence: a live 3D knowledge graph from code and documents, with GraphRAG chat.",
     lifespan=lifespan,
 )
-import inspect
-
-from fastapi.middleware.gzip import GZipMiddleware
-from starlette.middleware.cors import CORSMiddleware as _CORS
-
-_cors_kwargs = dict(allow_origins=settings.cors_origins, allow_credentials=False, allow_methods=["*"], allow_headers=["*"], max_age=86400)
-_native_pna = "allow_private_network" in inspect.signature(_CORS.__init__).parameters
-if _native_pna:  # newer Starlette answers Chrome's private-network preflight itself
-    _cors_kwargs["allow_private_network"] = True
-app.add_middleware(GZipMiddleware, minimum_size=1024)
-app.add_middleware(CORSMiddleware, **_cors_kwargs)
-
-
-class PrivateNetworkAccess:
-    """Chrome/Edge require this header when a public website (your Vercel frontend) talks to http://127.0.0.1.
-    It answers the browser's preflight so the hosted UI can connect to the server running on your machine."""
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            return await self.app(scope, receive, send)
-        wants = any(k == b"access-control-request-private-network" and v.lower() == b"true" for k, v in scope["headers"])
-
-        async def send_wrapper(message):
-            if wants and message["type"] == "http.response.start":
-                headers = list(message.get("headers", []))
-                headers.append((b"access-control-allow-private-network", b"true"))
-                message = {**message, "headers": headers}
-            await send(message)
-
-        await self.app(scope, receive, send_wrapper)
-
-
-if not _native_pna:  # older Starlette: add the header ourselves
-    app.add_middleware(PrivateNetworkAccess)
-
-
-import re
 
 
 def is_origin_allowed(origin: str | None) -> bool:
     if not origin:
         return True
-    origins = settings.cors_origins
-    if "*" in origins:
+    if "*" in settings.cors_origins or origin in settings.cors_origins:
         return True
-    if origin in origins:
-        return True
-    regex = settings.cors_origin_regex
-    if regex and re.match(regex, origin):
-        return True
-    return False
+    regex = settings.cors_origin_regex or r"^https://([a-z0-9-]+\.)*vercel\.app$|^http://(localhost|127\.0\.0\.1)(:\d+)?$"
+    return bool(re.match(regex, origin))
 
 
-class PingPermissiveMiddleware:
-    """Outermost pure-ASGI middleware specifically for /api/ping.
-    Answers OPTIONS preflights with 204 and CORS/PNA headers.
-    Ensures GET /api/ping responses carry Access-Control-Allow-Origin: * and Access-Control-Allow-Private-Network: true."""
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
-            path = scope.get("path", "")
-            if path == "/api/ping":
-                method = scope.get("method", "").upper()
-                if method == "OPTIONS":
-                    headers = [
-                        (b"access-control-allow-origin", b"*"),
-                        (b"access-control-allow-methods", b"GET, OPTIONS"),
-                        (b"access-control-allow-headers", b"*"),
-                        (b"access-control-allow-private-network", b"true"),
-                        (b"access-control-max-age", b"86400"),
-                    ]
-                    await send({
-                        "type": "http.response.start",
-                        "status": 204,
-                        "headers": headers,
-                    })
-                    await send({"type": "http.response.body", "body": b""})
-                    return
-
-                if method == "GET":
-                    async def send_wrapper(message):
-                        if message["type"] == "http.response.start":
-                            headers = [
-                                (k, v) for k, v in message.get("headers", [])
-                                if k.lower() not in (b"access-control-allow-origin", b"access-control-allow-private-network")
-                            ]
-                            headers.append((b"access-control-allow-origin", b"*"))
-                            headers.append((b"access-control-allow-private-network", b"true"))
-                            message = {**message, "headers": headers}
-                        await send(message)
-
-                    await self.app(scope, receive, send_wrapper)
-                    return
-
-        await self.app(scope, receive, send)
-
-
-app.add_middleware(PingPermissiveMiddleware)
+_cors = dict(allow_origins=settings.cors_origins, allow_credentials=False, allow_methods=["*"], allow_headers=["*"], max_age=86400,
+             allow_origin_regex=settings.cors_origin_regex or r"^https://([a-z0-9-]+\.)*vercel\.app$|^http://(localhost|127\.0\.0\.1)(:\d+)?$")
+try:
+    app.add_middleware(CORSMiddleware, allow_private_network=True, **_cors)
+except TypeError:  # older Starlette
+    app.add_middleware(CORSMiddleware, **_cors)
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+app.add_middleware(OwnerMiddleware)
 
 
 @app.exception_handler(IngestError)
@@ -154,20 +74,15 @@ async def ingest_error_handler(_: Request, exc: IngestError):
 
 
 @app.exception_handler(Exception)
-async def generic_exception_handler(_: Request, exc: Exception):
-    from fastapi import HTTPException
-    from starlette.exceptions import HTTPException as StarletteHTTPException
-
-    if isinstance(exc, (HTTPException, StarletteHTTPException)):
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=getattr(exc, "headers", None))
-    logging.getLogger("nexmind").exception("Unhandled error: %s", exc)
-    return JSONResponse(status_code=500, content={"detail": f"Internal server error: {exc}"})
+async def unexpected_error(_: Request, exc: Exception):
+    log.exception("Unhandled error: %s", exc)
+    return JSONResponse(status_code=500, content={"detail": "The server hit a problem. Try again; details are in the server log."})
 
 
 app.include_router(workspaces.router)
 app.include_router(graph_routes.router)
 app.include_router(chat_routes.router)
-app.include_router(ws.router)
+app.include_router(events_api.router)
 app.include_router(connect.router)
 app.include_router(connect_script.router)
 
@@ -175,26 +90,45 @@ app.include_router(connect_script.router)
 @app.get("/api/ping", tags=["system"])
 def ping(request: Request) -> dict:
     origin = request.headers.get("origin")
-    allowed = is_origin_allowed(origin)
-    return {
-        "app": "nexmind",
-        "ok": True,
-        "version": __version__,
-        "origin_allowed": allowed,
-        "origin": origin,
-    }
+    return {"app": "nexmind", "ok": True, "version": __version__, "origin_allowed": is_origin_allowed(origin), "origin": origin}
+
+
+def setup_problem() -> str | None:
+    if settings.hosted and not db.persistent and os.environ.get("NEXMIND_ALLOW_EPHEMERAL") != "1":
+        return ("Storage is not set up yet. In Vercel open Storage, add a Postgres database (Neon), connect it to this "
+                "project, then redeploy.")
+    return None
 
 
 @app.get("/api/health", tags=["system"])
 def health() -> dict:
     return {
         "app": "nexmind", "status": "ok", "version": __version__,
-        "capabilities": {"local_paths": settings.allow_local_paths, "git_token": True, "websocket": True, "sse_chat": True},
-        "platform": sys.platform, "python": sys.version.split()[0], "python_executable": sys.executable,
-        "install_dir": str(Path(__file__).resolve().parent), "llm": get_llm().info(), "embeddings": settings.embeddings,
+        "hosted": settings.hosted, "platform_host": "vercel" if settings.on_vercel else "local",
+        "storage": {"dialect": db.dialect, "persistent": db.persistent or not settings.hosted},
+        "setup_required": setup_problem(),
+        "capabilities": {"local_paths": settings.allow_local_paths, "git_token": True, "websocket": False, "events": True,
+                         "sse_chat": True, "chunked_upload": True, "background_jobs": settings.background_jobs},
+        "upload": {"chunk_bytes": int(settings.upload_chunk_mb * 1024 * 1024), "max_mb": settings.max_upload_mb},
+        "platform": sys.platform, "python": sys.version.split()[0],
+        "python_executable": None if settings.hosted else sys.executable,
+        "install_dir": None if settings.hosted else str(Path(__file__).resolve().parent.parent),
+        "web_url": settings.web_url,
+        "llm": get_llm().info(), "embeddings": settings.embeddings,
         "limits": {"max_upload_mb": settings.max_upload_mb, "max_files": settings.max_files, "git_hosts": settings.git_hosts},
-        "workspaces": (db.one("SELECT COUNT(*) AS n FROM workspaces") or {}).get("n", 0),
+        "workspaces": _workspace_count(),
     }
+
+
+def _workspace_count() -> int:
+    from .owner import current_owner
+
+    if settings.hosted:
+        owner = current_owner()
+        r = db.one("SELECT COUNT(*) AS n FROM workspaces WHERE owner=?", (owner,)) if owner else None
+    else:
+        r = db.one("SELECT COUNT(*) AS n FROM workspaces")
+    return int(r["n"]) if r else 0
 
 
 class LLMIn(BaseModel):
@@ -208,27 +142,27 @@ def llm_info() -> dict:
 
 
 @app.put("/api/llm", tags=["system"])
-def llm_switch(body: LLMIn) -> dict:
-    """Switch provider/model at runtime (API keys still come from environment variables)."""
+def llm_switch(body: LLMIn):
+    if settings.hosted:
+        return JSONResponse(status_code=403, content={"detail": "The hosted app uses the model configured by its owner."})
     if body.provider not in ("offline", "anthropic", "openai", "ollama", "mock"):
-        return JSONResponse(status_code=400, content={"detail": "provider must be offline | anthropic | openai | ollama"})  # type: ignore[return-value]
+        return JSONResponse(status_code=400, content={"detail": "provider must be offline | anthropic | openai | ollama"})
     set_llm(LLM(body.provider, body.model))
     return get_llm().info()
 
 
-# Optional: serve the built web app from ./frontend_dist (or NEXMIND_FRONTEND_DIR) so http://127.0.0.1:8000 is the whole product.
-# Unknown non-API paths fall back to index.html so client-side routes like /app/w/<id> survive a page refresh.
+# Local installs: serve the built web app from ./frontend_dist so http://127.0.0.1:8000 is the whole product.
 _fe = Path(os.environ.get("NEXMIND_FRONTEND_DIR", Path(__file__).resolve().parent.parent / "frontend_dist")).resolve()
-if (_fe / "index.html").exists():
-    from fastapi.responses import FileResponse, JSONResponse as _J
+if not settings.on_vercel and (_fe / "index.html").exists():
+    from fastapi.responses import FileResponse
 
     if (_fe / "assets").is_dir():
         app.mount("/assets", StaticFiles(directory=str(_fe / "assets")), name="assets")
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def spa(full_path: str):
-        if full_path.startswith(("api/", "ws/", "docs", "openapi.json", "redoc")):
-            return _J(status_code=404, content={"detail": "Not found"})
+        if full_path.startswith(("api/", "docs", "openapi.json", "redoc")):
+            return JSONResponse(status_code=404, content={"detail": "Not found"})
         candidate = (_fe / full_path).resolve()
         if full_path and _fe in candidate.parents and candidate.is_file():
             return FileResponse(candidate)

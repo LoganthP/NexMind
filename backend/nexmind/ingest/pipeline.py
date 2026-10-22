@@ -224,7 +224,7 @@ def resolve_import(lang: str, from_rel: str, imp: ImportRef, idx: PathIndex) -> 
 
 # ============================================================================ the pipeline
 
-def build_workspace_graph(ws_id: str, db: DB, store: GraphStore, emit: Emit) -> dict:
+def build_workspace_graph(ws_id: str, db: DB, store: GraphStore, emit: Emit, roots: dict | None = None) -> dict:
     t0 = time.time()
     llm = get_llm()
     ws = db.one("SELECT * FROM workspaces WHERE id=?", (ws_id,))
@@ -241,7 +241,9 @@ def build_workspace_graph(ws_id: str, db: DB, store: GraphStore, emit: Emit) -> 
     emit("progress", phase="scan", percent=3, message="Scanning files…")
     entries: list[tuple[dict, FileEntry]] = []
     for src in sources:
-        root = Path(src["path"])
+        root = Path(roots[src["id"]]) if roots and src["id"] in roots else Path(src["path"] or "")
+        if not src.get("path") and not (roots and src["id"] in roots):
+            continue
         if not root.exists():
             continue
         for fe in walk_source(root):

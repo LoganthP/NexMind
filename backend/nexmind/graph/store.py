@@ -1,14 +1,17 @@
 """Persistence + in-memory query structure for a workspace's knowledge graph."""
 from __future__ import annotations
 
+import gzip
+import json
 import re
 import threading
+import time
 from collections import defaultdict
 from typing import Any
 
 import networkx as nx
 
-from ..db import DB, dumps, loads
+from ..db import DB, dumps, loads, new_id, now
 
 
 class WorkspaceGraph:
@@ -124,50 +127,115 @@ class WorkspaceGraph:
         return [n for _, n in scored[:limit]]
 
 
+def _pack(obj) -> bytes:
+    return gzip.compress(json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"), compresslevel=6)
+
+
+def _unpack(data) -> Any:
+    if data is None:
+        return None
+    return json.loads(gzip.decompress(bytes(data)).decode("utf-8"))
+
+
 class GraphStore:
+    """Each workspace graph is stored as two compressed JSON blobs (core + chunks).
+
+    One row read per load works well on a remote Postgres (Vercel/Neon) and on local SQLite alike.
+    Every serverless instance keeps a cache and revalidates it with a tiny version query.
+    """
+
+    CHECK_TTL = 2.0  # seconds between version re-checks per workspace and instance
+
     def __init__(self, db: DB):
         self.db = db
-        self._cache: dict[str, WorkspaceGraph] = {}
+        self._cache: dict[str, tuple[str, WorkspaceGraph]] = {}
+        self._checked: dict[str, float] = {}
         self._lock = threading.Lock()
 
     def invalidate(self, ws_id: str) -> None:
         with self._lock:
             self._cache.pop(ws_id, None)
+            self._checked.pop(ws_id, None)
+
+    def _write(self, ws_id: str, core: dict, chunks: list[dict]) -> str:
+        version = new_id("v")
+        t = now()
+        core_blob, chunk_blob = _pack(core), _pack(chunks)
+
+        def tx(c):
+            c.execute("DELETE FROM graphs WHERE workspace_id IN (?, ?)", (ws_id, ws_id + "#chunks"))
+            c.execute("INSERT INTO graphs(workspace_id, version, data, updated_at) VALUES(?,?,?,?)", (ws_id, version, core_blob, t))
+            c.execute("INSERT INTO graphs(workspace_id, version, data, updated_at) VALUES(?,?,?,?)", (ws_id + "#chunks", version, chunk_blob, t))
+        self.db.run(tx)
+        self.invalidate(ws_id)
+        return version
 
     def save(self, ws_id: str, nodes: dict[str, dict], edges: dict[str, dict], chunks: list[dict], clusters: list[dict], insights: list[dict]) -> None:
-        with self.db.tx() as c:
-            for t in ("nodes", "edges", "chunks", "clusters"):
-                c.execute(f"DELETE FROM {t} WHERE workspace_id=?", (ws_id,))
-            c.executemany(
-                "INSERT INTO nodes(workspace_id,id,type,label,props,x,y,z,cluster,score) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                [(ws_id, n["id"], n["type"], n["label"], dumps(n["props"]), n.get("x", 0), n.get("y", 0), n.get("z", 0), n.get("cluster", 0), n.get("score", 0)) for n in nodes.values()],
-            )
-            c.executemany(
-                "INSERT INTO edges(workspace_id,id,src,dst,type,weight,props) VALUES(?,?,?,?,?,?,?)",
-                [(ws_id, e["id"], e["src"], e["dst"], e["type"], e["weight"], dumps(e["props"])) for e in edges.values()],
-            )
-            c.executemany(
-                "INSERT INTO chunks(workspace_id,id,source_id,node_id,kind,text,meta) VALUES(?,?,?,?,?,?,?)",
-                [(ws_id, ch["id"], ch.get("source_id"), ch["node_id"], ch["kind"], ch["text"], dumps(ch.get("meta", {}))) for ch in chunks],
-            )
-            c.executemany(
-                "INSERT INTO clusters(workspace_id,id,label,size,color,summary) VALUES(?,?,?,?,?,?)",
-                [(ws_id, k["id"], k["label"], k["size"], k["color"], k["summary"]) for k in clusters],
-            )
-            c.execute("INSERT OR REPLACE INTO insights(workspace_id,data) VALUES(?,?)", (ws_id, dumps(insights)))
-        self.invalidate(ws_id)
+        self._write(ws_id, {"nodes": nodes, "edges": edges, "clusters": clusters, "insights": insights}, chunks)
+
+    def update_positions(self, ws_id: str, nodes: dict[str, dict]) -> None:
+        """Rewrite the core blob only (used by relayout); chunks are kept."""
+        wg = self.get(ws_id)
+        core = {"nodes": nodes, "edges": wg.edges, "clusters": wg.clusters, "insights": wg.insights}
+        self._write(ws_id, core, wg.chunks)
 
     def clear(self, ws_id: str) -> None:
-        with self.db.tx() as c:
-            for t in ("nodes", "edges", "chunks", "clusters", "insights"):
-                c.execute(f"DELETE FROM {t} WHERE workspace_id=?", (ws_id,))
+        self.db.execute("DELETE FROM graphs WHERE workspace_id IN (?, ?)", (ws_id, ws_id + "#chunks"))
         self.invalidate(ws_id)
 
+    def has_graph(self, ws_id: str) -> bool:
+        return bool(self.db.one("SELECT 1 AS x FROM graphs WHERE workspace_id=?", (ws_id,))) or self._legacy_has(ws_id)
+
     def get(self, ws_id: str) -> WorkspaceGraph:
+        t = time.time()
         with self._lock:
-            wg = self._cache.get(ws_id)
-        if wg is not None:
-            return wg
+            cached = self._cache.get(ws_id)
+            fresh = cached is not None and t - self._checked.get(ws_id, 0) < self.CHECK_TTL
+        if fresh:
+            return cached[1]  # type: ignore[index]
+        row = self.db.one("SELECT version FROM graphs WHERE workspace_id=?", (ws_id,))
+        if row is None and self._legacy_has(ws_id):
+            self._migrate_legacy(ws_id)
+            row = self.db.one("SELECT version FROM graphs WHERE workspace_id=?", (ws_id,))
+        version = row["version"] if row else ""
+        if cached is not None and cached[0] == version:
+            with self._lock:
+                self._checked[ws_id] = t
+            return cached[1]
+        wg = self._load(ws_id, version)
+        with self._lock:
+            self._cache[ws_id] = (version, wg)
+            self._checked[ws_id] = t
+        return wg
+
+    def _load(self, ws_id: str, version: str) -> WorkspaceGraph:
+        if not version:
+            return WorkspaceGraph(ws_id, {}, {}, [], [], [])
+        r = self.db.one("SELECT data FROM graphs WHERE workspace_id=?", (ws_id,))
+        core = _unpack(r["data"]) if r else {}
+        db = self.db
+
+        class _Lazy(WorkspaceGraph):
+            @property
+            def chunks(self) -> list[dict]:  # type: ignore[override]
+                if self._chunks is None:
+                    rr = db.one("SELECT data FROM graphs WHERE workspace_id=?", (ws_id + "#chunks",))
+                    self._chunks = _unpack(rr["data"]) if rr else []
+                return self._chunks
+
+            @chunks.setter
+            def chunks(self, val: list[dict]) -> None:
+                self._chunks = val
+
+        return _Lazy(ws_id, core.get("nodes", {}), core.get("edges", {}), None, core.get("clusters", []), core.get("insights", []))
+
+    # ------------------------------------------------------------------ legacy (row-per-node) databases
+    def _legacy_has(self, ws_id: str) -> bool:
+        if self.db.dialect != "sqlite" or not self.db.table_exists("nodes"):
+            return False
+        return bool(self.db.one("SELECT 1 AS x FROM nodes WHERE workspace_id=? LIMIT 1", (ws_id,)))
+
+    def _migrate_legacy(self, ws_id: str) -> None:
         nodes = {
             r["id"]: {"id": r["id"], "type": r["type"], "label": r["label"], "props": loads(r["props"], {}), "x": r["x"], "y": r["y"], "z": r["z"], "cluster": r["cluster"], "score": r["score"]}
             for r in self.db.query("SELECT * FROM nodes WHERE workspace_id=?", (ws_id,))
@@ -176,9 +244,10 @@ class GraphStore:
             r["id"]: {"id": r["id"], "src": r["src"], "dst": r["dst"], "type": r["type"], "weight": r["weight"], "props": loads(r["props"], {})}
             for r in self.db.query("SELECT * FROM edges WHERE workspace_id=?", (ws_id,))
         }
-        clusters = self.db.query("SELECT id,label,size,color,summary FROM clusters WHERE workspace_id=? ORDER BY id", (ws_id,))
-        ins = self.db.one("SELECT data FROM insights WHERE workspace_id=?", (ws_id,))
-        wg = WorkspaceGraph(ws_id, nodes, edges, None, clusters, loads(ins["data"], []) if ins else [], db=self.db)
-        with self._lock:
-            self._cache[ws_id] = wg
-        return wg
+        chunks = [
+            {"id": r["id"], "source_id": r["source_id"], "node_id": r["node_id"], "kind": r["kind"], "text": r["text"], "meta": loads(r["meta"], {})}
+            for r in self.db.query("SELECT * FROM chunks WHERE workspace_id=?", (ws_id,))
+        ] if self.db.table_exists("chunks") else []
+        clusters = self.db.query("SELECT id,label,size,color,summary FROM clusters WHERE workspace_id=? ORDER BY id", (ws_id,)) if self.db.table_exists("clusters") else []
+        ins = self.db.one("SELECT data FROM insights WHERE workspace_id=?", (ws_id,)) if self.db.table_exists("insights") else None
+        self.save(ws_id, nodes, edges, chunks, clusters, loads(ins["data"], []) if ins else [])

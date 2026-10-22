@@ -1169,7 +1169,8 @@ export class BrainEngine {
     this.opts.quality = q
     const low = q === 'low'
     if (this.bloom) this.bloom.enabled = !low && (this.opts.glow > 0)
-    this.fg.renderer().setPixelRatio(Math.min(window.devicePixelRatio || 1, low ? 1.25 : 2))
+    if (this.dust) this.dust.visible = !low
+    this.fg.renderer().setPixelRatio(Math.min(window.devicePixelRatio || 1, low ? 1.0 : 2))
     this.updateEdgeBase()
   }
 

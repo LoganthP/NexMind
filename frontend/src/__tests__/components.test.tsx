@@ -127,12 +127,12 @@ describe('ConnectPanel component', () => {
 
     // Switch to Windows tab
     fireEvent.click(screen.getByRole('tab', { name: 'Windows' }))
-    const winBlocks = screen.getAllByText(/irm http:\/\/127\.0\.0\.1:8000\/connect\.py \| python - \./i)
+    const winBlocks = screen.getAllByText(/irm "http:\/\/127\.0\.0\.1:8000\/connect\.py\?k=[A-Za-z0-9_-]+" \| python - \./i)
     expect(winBlocks.length).toBeGreaterThan(0)
 
     // Switch to macOS tab
     fireEvent.click(screen.getByRole('tab', { name: 'macOS' }))
-    const macBlocks = screen.getAllByText(/curl -fsSL http:\/\/127\.0\.0\.1:8000\/connect\.py \| python3 - \./i)
+    const macBlocks = screen.getAllByText(/curl -fsSL "http:\/\/127\.0\.0\.1:8000\/connect\.py\?k=[A-Za-z0-9_-]+" \| python3 - \./i)
     expect(macBlocks.length).toBeGreaterThan(0)
 
     // Check help / fallback section

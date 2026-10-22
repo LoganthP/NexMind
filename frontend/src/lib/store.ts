@@ -64,6 +64,7 @@ export const useSettings = create<SettingsState>((set, get) => ({
     const { solid, perf, autoRotate, theme, glow, version } = get()
     try { localStorage.setItem(SKEY, JSON.stringify({ solid, perf, autoRotate, theme, glow, version })) } catch { /* ignore */ }
     document.documentElement.dataset.solid = String(solid)
+    document.documentElement.dataset.perf = String(perf)
   },
 }))
 

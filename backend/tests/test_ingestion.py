@@ -12,7 +12,6 @@ from fastapi.testclient import TestClient
 
 from nexmind.main import app
 from nexmind.state import db, jobs
-from nexmind.api.workspaces import ws_dir
 from nexmind.ingest.files import IngestError
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -77,10 +76,12 @@ def test_path_traversal_archive_protection(client):
     job = wait_job(client, r_up.json()["job_id"])
     assert job["status"] == "done"
 
-    # Verify that evil_escape.txt was NEVER written outside the source directory
-    base = ws_dir(ws_id)
-    assert not (base.parent / "evil_escape.txt").exists()
-    assert not (base.parent.parent / "evil_escape.txt").exists()
+    # The traversal entry must never be stored, and nothing may escape the data folder
+    stored = [r["path"] for r in db.query("SELECT path FROM files WHERE workspace_id=?", (ws_id,))]
+    assert stored and all(".." not in p and not p.startswith("/") for p in stored)
+    assert not any("evil_escape" in p for p in stored)
+    from nexmind.config import settings
+    assert not (settings.data_dir.parent / "evil_escape.txt").exists()
 
 
 def test_corrupt_pdf_does_not_kill_ingest(client):
@@ -116,11 +117,13 @@ def test_git_ingest_mocked(client, monkeypatch):
     assert "not allowed" in r_bad_host.json()["detail"].lower()
 
     # 2. Mock git_clone for public repo
-    def fake_git_clone(url: str, dest: Path, branch: str | None = None, token: str | None = None):
-        dest.mkdir(parents=True, exist_ok=True)
-        (dest / "sample.py").write_text("def cloned_func(): return True\n", encoding="utf-8")
+    def fake_fetch(url: str, dest: Path, branch: str | None = None, token: str | None = None):
+        out = dest / "repo"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "sample.py").write_text("def cloned_func(): return True\n", encoding="utf-8")
+        return out
 
-    monkeypatch.setattr("nexmind.api.workspaces.git_clone", fake_git_clone)
+    monkeypatch.setattr("nexmind.api.workspaces.fetch_repository", fake_fetch)
 
     # Ingest public repo
     r_git = client.post(f"/api/workspaces/{ws_id}/ingest/git", json={"url": "https://github.com/org/public-repo"})
@@ -148,15 +151,13 @@ def test_git_ingest_mocked(client, monkeypatch):
         assert secret_token not in str(j)
 
     # 4. Timeout and auth failure friendly messages
-    def fake_clone_auth_error(url, dest, branch=None, token=None):
-        raise IngestError("Repository not found or private. For a private repo, paste an access token with read access.")
+    def fake_fetch_auth_error(url, dest, branch=None, token=None):
+        raise IngestError("Repository or branch not found, or it is private. For a private repository, paste an access token with read access.")
 
-    monkeypatch.setattr("nexmind.api.workspaces.git_clone", fake_clone_auth_error)
+    monkeypatch.setattr("nexmind.api.workspaces.fetch_repository", fake_fetch_auth_error)
     r_auth_err = client.post(f"/api/workspaces/{ws_id}/ingest/git", json={"url": "https://github.com/org/private-error"})
-    assert r_auth_err.status_code == 202
-    job_err = wait_job(client, r_auth_err.json()["job_id"])
-    assert job_err["status"] == "failed"
-    assert "private" in job_err["error"].lower()
+    assert r_auth_err.status_code == 400
+    assert "private" in r_auth_err.json()["detail"].lower()
 
 
 def test_job_queue_concurrency(client):
@@ -213,8 +214,8 @@ def test_restart_recovery_marks_interrupted_jobs_failed():
 
     # Instantiate JobManager again to simulate restart recovery
     from nexmind.jobs import JobManager
-    from nexmind.state import store
-    _ = JobManager(db, store)
+    from nexmind.state import events, files, store
+    _ = JobManager(db, store, files, events)
 
     job_row = db.one("SELECT * FROM jobs WHERE id=?", (test_job,))
     assert job_row["status"] == "failed"

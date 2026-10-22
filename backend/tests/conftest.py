@@ -16,4 +16,6 @@ from nexmind.state import db, store, jobs
 @pytest.fixture(scope="session", autouse=True)
 def test_environment_lifecycle():
     yield
+    if jobs.pool is not None:  # let background builds finish before the temp data folder is removed
+        jobs.pool.shutdown(wait=True, cancel_futures=True)
     shutil.rmtree(_TEST_DATA_DIR, ignore_errors=True)
