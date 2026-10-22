@@ -1,6 +1,7 @@
-# --- core (everything NexMind needs to run fully offline) ---
+# NexMind backend dependencies. Keep this list IDENTICAL to [project].dependencies in pyproject.toml
+# (Vercel may read either file). Everything here installs from pre-built wheels; pg8000 is pure Python.
 fastapi>=0.110
-uvicorn[standard]>=0.27
+uvicorn>=0.27
 python-multipart>=0.0.9
 python-dotenv>=1.0
 networkx>=3.2
@@ -9,8 +10,4 @@ scipy>=1.11
 scikit-learn>=1.4
 pypdf>=4.0
 python-docx>=1.1
-langchain-text-splitters>=0.2
-langchain-core>=0.2
-
-psycopg[binary]>=3.1
-langchain-openai>=0.2
+pg8000>=1.30

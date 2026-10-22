@@ -77,24 +77,54 @@ class GraphBuilder:
 
 # ============================================================================ text splitting
 
+class RecursiveSplitter:
+    """Recursive text splitter (paragraphs, then lines, then sentences, then words), with overlap.
+
+    Same behaviour as LangChain's RecursiveCharacterTextSplitter for our purposes, without the dependency."""
+
+    CODE_SEPS = ["\nclass ", "\ndef ", "\nfunction ", "\nexport ", "\n\n", "\n", " ", ""]
+    TEXT_SEPS = ["\n\n", "\n", ". ", " ", ""]
+
+    def __init__(self, size: int, overlap: int, code: bool = False):
+        self.size = max(200, size)
+        self.overlap = max(0, min(overlap, self.size // 2))
+        self.seps = self.CODE_SEPS if code else self.TEXT_SEPS
+
+    def _split(self, text: str, seps: list[str]) -> list[str]:
+        if len(text) <= self.size:
+            return [text]
+        sep = next((x for x in seps if x and x in text), "")
+        if not sep:
+            step = self.size - self.overlap
+            return [text[i:i + self.size] for i in range(0, len(text), step)]
+        rest = seps[seps.index(sep) + 1:]
+        parts = text.split(sep)
+        out: list[str] = []
+        cur = ""
+        for i, part in enumerate(parts):
+            piece = (sep if i else "") + part
+            if len(cur) + len(piece) <= self.size:
+                cur += piece
+                continue
+            if cur:
+                out.append(cur)
+            if len(piece) > self.size:
+                out.extend(self._split(piece, rest))
+                cur = ""
+            else:
+                cur = (out[-1][-self.overlap:] if out and self.overlap else "") + piece
+                if len(cur) > self.size:
+                    cur = piece
+        if cur:
+            out.append(cur)
+        return out
+
+    def split_text(self, text: str) -> list[str]:
+        return [c for c in self._split(text or "", self.seps) if c.strip()]
+
+
 def _splitter(language: str | None = None):
-    try:
-        from langchain_text_splitters import Language, RecursiveCharacterTextSplitter
-
-        if language:
-            lang_map = {"python": Language.PYTHON, "javascript": Language.JS, "typescript": Language.TS, "java": Language.JAVA,
-                        "go": Language.GO, "rust": Language.RUST, "cpp": Language.CPP, "c": Language.C, "csharp": Language.CSHARP,
-                        "php": Language.PHP, "ruby": Language.RUBY, "kotlin": Language.KOTLIN, "swift": Language.SWIFT}
-            if language in lang_map:
-                return RecursiveCharacterTextSplitter.from_language(lang_map[language], chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap)
-        return RecursiveCharacterTextSplitter(chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap)
-    except Exception:  # langchain missing -> trivial fallback splitter
-        class _Fallback:
-            def split_text(self, t: str) -> list[str]:
-                size, step = settings.chunk_size, settings.chunk_size - settings.chunk_overlap
-                return [t[i : i + size] for i in range(0, max(len(t), 1), step)]
-
-        return _Fallback()
+    return RecursiveSplitter(settings.chunk_size, settings.chunk_overlap, code=bool(language))
 
 
 # ============================================================================ import resolution

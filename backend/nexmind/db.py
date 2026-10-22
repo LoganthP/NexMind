@@ -183,10 +183,54 @@ def format_db_error(e: Exception) -> str:
     return cls_name
 
 
-def _fix_row(r: Any) -> dict:
-    d = dict(r)
+def connect_postgres(url: str) -> Any:
+    """Open a Postgres connection with pg8000 (pure Python, so it always installs on Vercel).
+
+    Understands Neon/Vercel URLs: postgres(ql)://user:pass@host[:port]/db?sslmode=require&channel_binding=...&options=...
+    """
+    import ssl
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    import pg8000.dbapi
+
+    u = urlparse(url)
+    q = {k: v[-1] for k, v in parse_qs(u.query).items()}
+    host = u.hostname or "localhost"
+    local = host in ("localhost", "127.0.0.1", "::1") or host.startswith("/")
+    sslmode = (q.get("sslmode") or ("disable" if local else "require")).lower()
+    kwargs: dict[str, Any] = {
+        "user": unquote(u.username or ""),
+        "password": unquote(u.password or "") or None,
+        "host": host,
+        "port": u.port or 5432,
+        "database": unquote((u.path or "/").lstrip("/")) or None,
+        "timeout": 20,
+        "application_name": "nexmind",
+    }
+    if "host" in q and q["host"].startswith("/"):  # unix socket (local test servers)
+        kwargs.pop("host")
+        kwargs.pop("port")
+        kwargs["unix_sock"] = q["host"].rstrip("/") + f"/.s.PGSQL.{u.port or 5432}"
+    if sslmode not in ("disable", "allow", "prefer"):
+        ctx = ssl.create_default_context()
+        if sslmode in ("require", "allow", "prefer"):  # encrypted but no CA check, like libpq's 'require'
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        kwargs["ssl_context"] = ctx
+    if q.get("options"):
+        kwargs["startup_params"] = {"options": q["options"]}
+    try:
+        return pg8000.dbapi.connect(**kwargs)
+    except TypeError:  # very old pg8000 without startup_params
+        kwargs.pop("startup_params", None)
+        return pg8000.dbapi.connect(**kwargs)
+
+
+def _fix_row(r: Any, names: list[str] | None = None) -> dict:
+    # sqlite3.Row behaves like a mapping; pg8000 returns plain lists (names come from cursor.description)
+    d = dict(zip(names, r)) if names is not None and not hasattr(r, "keys") else dict(r)
     for k, v in d.items():
-        if isinstance(v, memoryview):
+        if isinstance(v, (memoryview, bytearray)):
             d[k] = bytes(v)
     return d
 
@@ -195,6 +239,9 @@ class _Cursor:
     def __init__(self, cur: Any):
         self._cur = cur
 
+    def _names(self) -> list[str]:
+        return [c[0] for c in (self._cur.description or [])]
+
     @property
     def rowcount(self) -> int:
         return self._cur.rowcount
@@ -202,13 +249,14 @@ class _Cursor:
     def fetchall(self) -> list[dict]:
         if self._cur.description is None:
             return []
-        return [_fix_row(r) for r in self._cur.fetchall()]
+        names = self._names()
+        return [_fix_row(r, names) for r in self._cur.fetchall()]
 
     def fetchone(self) -> dict | None:
         if self._cur.description is None:
             return None
         r = self._cur.fetchone()
-        return _fix_row(r) if r is not None else None
+        return _fix_row(r, self._names()) if r is not None else None
 
 
 class _Tx:
@@ -266,12 +314,8 @@ class DB:
         return conn
 
     def _postgres(self) -> Any:
-        import psycopg
-        from psycopg.rows import dict_row
-
-        if self._pg is None or self._pg.closed or self._pg.broken:
-            # prepare_threshold=None keeps it compatible with PgBouncer / Neon pooled endpoints
-            self._pg = psycopg.connect(self.url, row_factory=dict_row, prepare_threshold=None, connect_timeout=15)
+        if self._pg is None:
+            self._pg = connect_postgres(self.url or "")
         return self._pg
 
     @contextmanager
@@ -304,7 +348,7 @@ class DB:
             with self.tx() as t:
                 return fn(t)
         except Exception as e:
-            if self.dialect == "postgres" and type(e).__name__ in {"OperationalError", "InterfaceError"}:
+            if self.dialect == "postgres" and (type(e).__name__ in {"OperationalError", "InterfaceError"} or isinstance(e, (ConnectionError, OSError))):
                 self._pg = None  # stale serverless connection: reconnect once and retry the whole transaction
                 with self.tx() as t:
                     return fn(t)

@@ -1,21 +1,21 @@
-# Deploying NexMind to Vercel
+# Deploying NexMind on Vercel
 
-One Vercel project serves both the web app (static, `frontend/dist`) and the API (Python function, `api/index.py`).
+`vercel.json` deploys two services from this repository: `frontend/` (Vite web app) and `backend/` (FastAPI).
+`/api/*` and `/connect.py` go to the backend, everything else to the web app.
 
-1. **Settings → General**: Root Directory `./`, Framework Preset **Other**, build/output fields empty (set by `vercel.json`).
-2. **Storage → Create Database → Neon (Postgres)**, connect to this project for Production, Preview and Development. This sets `DATABASE_URL`.
-3. **Settings → Environment Variables**: `OPENAI_API_KEY` (optional `NEXMIND_LLM_MODEL`).
-4. Push to `main` (or **Redeploy**).
-5. Check `https://<your-site>/api/health`: `"hosted": true`, `"storage": {"dialect": "postgres"}`, `"setup_required": null`.
+## One-time setup
+1. Vercel → Project → Settings → General: **Root Directory `./`** (repository root). Leave the build settings to `vercel.json`.
+2. Vercel → Storage → your **Neon** database → **Connect Project** → this project, **all environments**.
+3. Settings → Environment Variables: `OPENAI_API_KEY` (optional: `NEXMIND_LLM_MODEL`, default `gpt-4o-mini`).
+4. Deployments → latest → **⋯ → Redeploy**, untick **Use existing Build Cache**.
+5. Open `https://<your-domain>/api/health` → `"dialect": "postgres"` and `"setup_required": null`.
 
-Optional variables: `NEXMIND_MAX_UPLOAD_MB` (120), `NEXMIND_MAX_WORKSPACES` (30), `NEXMIND_CORS_ORIGINS`.
+## Backend dependencies
+`backend/requirements.txt` and `[project].dependencies` in `backend/pyproject.toml` must stay identical
+(Vercel may read either one). A test (`backend/tests/test_dependency_lists.py`) fails if they drift or if the
+code imports a package that is not listed. The Postgres driver is `pg8000` (pure Python), and OpenAI is called over
+plain HTTPS, so there are no compiled drivers or SDKs to go missing.
 
-Remove the previously committed `node_modules` folders from Git once (they slow every deploy):
-
-```powershell
-git rm -r --cached node_modules
-git rm -r --cached frontend/node_modules
-git commit -m "Stop tracking node_modules"
-```
-
-Rollback: Vercel → Deployments → choose a previous deployment → **Promote to Production**.
+## If something fails
+`/api/health` always answers with a readable sentence (database missing, unreachable, password rejected, ...).
+Function logs: Deployments → latest → Logs.

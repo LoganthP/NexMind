@@ -2,7 +2,7 @@ import type {
   ChatMessage, EdgeDetail, FsListing, GraphPayload, Health, ImpactResult, Insight, JobInfo, NodeDetail, ProcessItem,
   Retrieval, SearchResult, SourceItem, Thread, TraceResult, TreeNode, Workspace, Citation,
 } from './types'
-import { beginActivity, endActivity } from './server'
+import { beginActivity, endActivity } from './activity'
 
 const KEY = 'nexmind.api.v2' // v1 stored http://127.0.0.1:8000 on hosted sites; ignored from now on
 const BROWSER_KEY = 'nexmind.key'

@@ -33,6 +33,7 @@ MAX_TOTAL = 100 * 1024 * 1024
 
 
 def say(msg=""):
+    msg = msg.replace("\u2026", "...").replace("\u2192", "->")
     try:
         if isinstance(msg, str):
             msg = msg.encode("ascii", "replace").decode("ascii")

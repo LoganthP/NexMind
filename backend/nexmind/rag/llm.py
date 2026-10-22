@@ -1,49 +1,58 @@
-"""LLM access through LangChain chat models. Providers: anthropic | openai | ollama | offline | mock.
+"""LLM access over plain HTTPS (standard library only, nothing extra to install).
 
+Providers: openai | anthropic | ollama | offline | mock.
 `offline` means no model at all: NexMind still works (retrieval, graph, extractive answers) with zero API keys.
+Configure with OPENAI_API_KEY (and optionally NEXMIND_LLM_MODEL, OPENAI_BASE_URL).
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
-from typing import Any, AsyncIterator
+import threading
+import urllib.error
+import urllib.request
+from typing import AsyncIterator, Iterator
 
 from ..config import settings
 
 log = logging.getLogger("nexmind.llm")
 
 DEFAULT_MODELS = {"anthropic": "claude-sonnet-5-5", "openai": "gpt-4o-mini", "ollama": "llama3.1"}
+TIMEOUT = 120
 
 
-def _text(chunk: Any) -> str:
-    c = getattr(chunk, "content", chunk)
-    if isinstance(c, str):
-        return c
-    if isinstance(c, list):
-        parts = []
-        for b in c:
-            if isinstance(b, str):
-                parts.append(b)
-            elif isinstance(b, dict) and b.get("type", "text") == "text":
-                parts.append(b.get("text", ""))
-        return "".join(parts)
-    return ""
+class LLMError(Exception):
+    pass
+
+
+def _post(url: str, headers: dict, body: dict, stream: bool):
+    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), method="POST",
+                                 headers={"Content-Type": "application/json", **headers})
+    try:
+        return urllib.request.urlopen(req, timeout=TIMEOUT)
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = json.loads(e.read().decode("utf-8", "ignore")).get("error", {})
+            detail = detail.get("message", "") if isinstance(detail, dict) else str(detail)
+        except Exception:
+            pass
+        raise LLMError(f"HTTP {e.code}: {detail or e.reason}") from None
+    except urllib.error.URLError as e:
+        raise LLMError(f"Cannot reach the model provider: {e.reason}") from None
 
 
 class LLM:
     def __init__(self, provider: str | None = None, model: str | None = None):
         self.provider = (provider or settings.llm_provider or "offline").lower()
         self.model = model or settings.llm_model or DEFAULT_MODELS.get(self.provider, "")
-        self._chat: Any = None
         self.last_error: str | None = None
-        self._disabled_reason: str | None = None
         self.mock_complete_reply = "[]"  # test hook
 
     @property
     def available(self) -> bool:
-        if self._disabled_reason:
-            return False
         if self.provider in ("offline", "none", ""):
             return False
         if self.provider == "openai" and not os.environ.get("OPENAI_API_KEY", "").strip():
@@ -53,50 +62,77 @@ class LLM:
         return True
 
     def info(self) -> dict:
-        return {"provider": self.provider, "model": self.model if self.available else None, "available": self.available, "last_error": self.last_error or self._disabled_reason}
+        return {"provider": self.provider, "model": self.model if self.available else None, "available": self.available, "last_error": self.last_error}
 
-    def _mark_error(self, e: Exception) -> None:
-        self.last_error = f"{type(e).__name__}: {e}"
-        err_str = f"{type(e).__name__} {e}".lower()
-        if any(w in err_str for w in ("ratelimit", "429", "credit_balance_exhausted", "quota", "insufficient_quota", "unauthorized", "401", "invalid_api_key")):
-            self._disabled_reason = self.last_error
+    # ------------------------------------------------------------------ providers (sync generators of text pieces)
+    def _openai(self, system: str, messages: list[dict], stream: bool) -> Iterator[str]:
+        base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+        body = {"model": self.model, "temperature": 0.2, "stream": stream,
+                "messages": [{"role": "system", "content": system}] + [{"role": m["role"], "content": m["content"]} for m in messages]}
+        r = _post(f"{base}/chat/completions", {"Authorization": f"Bearer {os.environ['OPENAI_API_KEY'].strip()}"}, body, stream)
+        with r:
+            if not stream:
+                data = json.loads(r.read().decode("utf-8"))
+                yield data["choices"][0]["message"].get("content") or ""
+                return
+            for raw in r:
+                line = raw.decode("utf-8", "ignore").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    delta = json.loads(payload)["choices"][0].get("delta", {}).get("content")
+                except (ValueError, KeyError, IndexError):
+                    continue
+                if delta:
+                    yield delta
 
-    # ------------------------------------------------------------------ construction
-    def _build(self) -> Any:
-        if self._chat is not None:
-            return self._chat
-        p = self.provider
-        try:
-            if p == "anthropic":
-                from langchain_anthropic import ChatAnthropic
+    def _anthropic(self, system: str, messages: list[dict], stream: bool) -> Iterator[str]:
+        body = {"model": self.model, "max_tokens": 1800, "temperature": 0.2, "system": system, "stream": stream,
+                "messages": [{"role": "assistant" if m["role"] == "assistant" else "user", "content": m["content"]} for m in messages]}
+        r = _post("https://api.anthropic.com/v1/messages", {"x-api-key": os.environ["ANTHROPIC_API_KEY"].strip(), "anthropic-version": "2023-06-01"}, body, stream)
+        with r:
+            if not stream:
+                data = json.loads(r.read().decode("utf-8"))
+                yield "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+                return
+            for raw in r:
+                line = raw.decode("utf-8", "ignore").strip()
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    ev = json.loads(line[5:].strip())
+                except ValueError:
+                    continue
+                if ev.get("type") == "content_block_delta":
+                    t = ev.get("delta", {}).get("text")
+                    if t:
+                        yield t
 
-                self._chat = ChatAnthropic(model=self.model, temperature=0.2, max_tokens=1800, timeout=10.0, max_retries=1)
-            elif p == "openai":
-                from langchain_openai import ChatOpenAI
+    def _ollama(self, system: str, messages: list[dict], stream: bool) -> Iterator[str]:
+        body = {"model": self.model, "stream": stream, "messages": [{"role": "system", "content": system}] + messages}
+        r = _post(f"{settings.ollama_base_url.rstrip('/')}/api/chat", {}, body, stream)
+        with r:
+            if not stream:
+                yield json.loads(r.read().decode("utf-8")).get("message", {}).get("content", "")
+                return
+            for raw in r:
+                try:
+                    t = json.loads(raw.decode("utf-8")).get("message", {}).get("content")
+                except ValueError:
+                    continue
+                if t:
+                    yield t
 
-                self._chat = ChatOpenAI(model=self.model, temperature=0.2, max_tokens=1800, timeout=10.0, max_retries=1)
-            elif p == "ollama":
-                from langchain_ollama import ChatOllama
+    def _gen(self, system: str, messages: list[dict], stream: bool) -> Iterator[str]:
+        fn = {"openai": self._openai, "anthropic": self._anthropic, "ollama": self._ollama}.get(self.provider)
+        if fn is None:
+            raise LLMError(f"Unknown LLM provider '{self.provider}'")
+        return fn(system, messages, stream)
 
-                self._chat = ChatOllama(model=self.model, base_url=settings.ollama_base_url, temperature=0.2, timeout=10.0)
-            else:
-                raise RuntimeError(f"Unknown LLM provider '{p}'")
-        except ImportError as e:
-            raise RuntimeError(
-                f"Provider '{p}' needs an extra package: pip install -r requirements-llm.txt  ({e})"
-            ) from e
-        return self._chat
-
-    @staticmethod
-    def _messages(system: str, messages: list[dict]) -> list:
-        from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-
-        out: list = [SystemMessage(content=system)]
-        for m in messages:
-            out.append(AIMessage(content=m["content"]) if m["role"] == "assistant" else HumanMessage(content=m["content"]))
-        return out
-
-    # ------------------------------------------------------------------ generation
+    # ------------------------------------------------------------------ public API (unchanged)
     async def astream(self, system: str, messages: list[dict]) -> AsyncIterator[str]:
         if self.provider == "mock":
             reply = "(mock model) " + messages[-1]["content"][-300:]
@@ -104,28 +140,40 @@ class LLM:
                 yield w + " "
                 await asyncio.sleep(0)
             return
-        chat = self._build()
-        try:
-            async for chunk in chat.astream(self._messages(system, messages)):
-                t = _text(chunk)
-                if t:
-                    yield t
-            self.last_error = None
-        except Exception as e:
-            self._mark_error(e)
-            raise
+        loop = asyncio.get_running_loop()
+        q: asyncio.Queue = asyncio.Queue()
+        done = object()
+
+        def worker() -> None:
+            try:
+                for piece in self._gen(system, messages, True):
+                    loop.call_soon_threadsafe(q.put_nowait, piece)
+                self.last_error = None
+            except Exception as e:  # noqa: BLE001
+                self.last_error = f"{type(e).__name__}: {e}"
+                loop.call_soon_threadsafe(q.put_nowait, e)
+            finally:
+                loop.call_soon_threadsafe(q.put_nowait, done)
+
+        threading.Thread(target=worker, daemon=True).start()
+        while True:
+            item = await q.get()
+            if item is done:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
 
     def complete(self, system: str, prompt: str) -> str:
         """Blocking call for worker threads (entity extraction, summaries)."""
         if self.provider == "mock":
             return self.mock_complete_reply
-        chat = self._build()
         try:
-            res = chat.invoke(self._messages(system, [{"role": "user", "content": prompt}]))
+            text = "".join(self._gen(system, [{"role": "user", "content": prompt}], False))
             self.last_error = None
-            return _text(res)
+            return text
         except Exception as e:
-            self._mark_error(e)
+            self.last_error = f"{type(e).__name__}: {e}"
             raise
 
 

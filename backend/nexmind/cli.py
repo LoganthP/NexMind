@@ -52,7 +52,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
 
     print(f"\n  NexMind doctor ({__version__})\n")
     line(sys.version_info >= (3, 10), "Python 3.10+", sys.version.split()[0])
-    for mod in ("fastapi", "uvicorn", "networkx", "numpy", "scipy", "sklearn", "pypdf", "docx", "langchain_text_splitters", "multipart"):
+    for mod in ("fastapi", "uvicorn", "networkx", "numpy", "scipy", "sklearn", "pypdf", "docx", "multipart", "pg8000"):
         try:
             importlib.import_module(mod)
             line(True, f"package {mod}")
