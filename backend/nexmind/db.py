@@ -100,12 +100,87 @@ def loads(s: str | None, default: Any = None) -> Any:
         return default
 
 
-def database_url() -> str | None:
-    for key in ("NEXMIND_DATABASE_URL", "DATABASE_URL", "POSTGRES_URL"):
-        v = os.environ.get(key)
+KNOWN_DB_ENV_VARS = (
+    "NEXMIND_DATABASE_URL",
+    "DATABASE_URL",
+    "POSTGRES_URL",
+    "POSTGRES_PRISMA_URL",
+    "DATABASE_URL_UNPOOLED",
+)
+
+
+def find_database_url() -> tuple[str | None, str | None]:
+    """Find the best database URL and the name of the environment variable providing it.
+
+    Accepts: NEXMIND_DATABASE_URL, DATABASE_URL, POSTGRES_URL, POSTGRES_PRISMA_URL,
+    DATABASE_URL_UNPOOLED, plus any variable ending in _DATABASE_URL or _POSTGRES_URL.
+    Prefers pooled URLs (host containing '-pooler').
+    """
+    candidates: list[tuple[str, str]] = []
+
+    for k in KNOWN_DB_ENV_VARS:
+        v = os.environ.get(k)
         if v and v.startswith(("postgres://", "postgresql://")):
-            return v
-    return None
+            candidates.append((k, v))
+
+    for k, v in os.environ.items():
+        if k in KNOWN_DB_ENV_VARS:
+            continue
+        if k.endswith(("_DATABASE_URL", "_POSTGRES_URL")):
+            if v and v.startswith(("postgres://", "postgresql://")):
+                candidates.append((k, v))
+
+    if not candidates:
+        return None, None
+
+    for k, v in candidates:
+        if "-pooler" in v:
+            return v, k
+
+    return candidates[0][1], candidates[0][0]
+
+
+def database_url() -> str | None:
+    return find_database_url()[0]
+
+
+def sanitize_credentials(text: str) -> str:
+    """Remove passwords and sensitive credentials from connection strings and error messages."""
+    if not text:
+        return text
+    import re
+
+    s = re.sub(r"(postgres(?:ql)?://[^:]+:)([^@]+)(@)", r"\1***\3", text)
+    s = re.sub(r"(password=)'[^']*'", r"\1'***'", s, flags=re.IGNORECASE)
+    s = re.sub(r"(password=)[^\s;]+", r"\1***", s, flags=re.IGNORECASE)
+    return s
+
+
+def format_db_error(e: Exception) -> str:
+    """Map common database connection errors to plain human sentences."""
+    msg = str(e) or ""
+    cls_name = type(e).__name__
+    lower_msg = msg.lower()
+
+    if "password authentication failed" in lower_msg or "authentication failed" in lower_msg:
+        return "Database password rejected: reconnect Neon in Vercel Storage and redeploy"
+
+    if (
+        "could not translate host name" in lower_msg
+        or "name or service not known" in lower_msg
+        or "connection timed out" in lower_msg
+        or "timeout" in lower_msg
+        or "connection refused" in lower_msg
+        or "network is unreachable" in lower_msg
+        or "getaddrinfo failed" in lower_msg
+    ):
+        return "Database unreachable: check DATABASE_URL"
+
+    first_line = msg.strip().splitlines()[0] if msg.strip() else ""
+    sanitized = sanitize_credentials(first_line)
+    if sanitized:
+        return f"{cls_name}: {sanitized}"
+    return cls_name
 
 
 def _fix_row(r: Any) -> dict:
@@ -158,17 +233,25 @@ class _Tx:
 
 
 class DB:
-    def __init__(self, path: Path | None = None, url: str | None = None):
+    def __init__(self, path: Path | None = None, url: str | None = None, lazy: bool = False):
         self.url = url if url is not None else database_url()
         self.dialect = "postgres" if self.url else "sqlite"
         self.path = Path(path) if path else None
         self._lock = threading.RLock()
         self._pg: Any = None
+        self._schema_initialized = False
         if self.dialect == "sqlite":
             if self.path is None:
                 raise ValueError("SQLite needs a file path")
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_schema()
+        if not lazy:
+            self.ensure_schema()
+
+    def ensure_schema(self) -> None:
+        with self._lock:
+            if not self._schema_initialized:
+                self._init_schema()
+                self._schema_initialized = True
 
     @property
     def persistent(self) -> bool:

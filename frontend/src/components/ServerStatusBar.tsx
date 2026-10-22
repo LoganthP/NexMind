@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { ExternalLink, Loader2 } from 'lucide-react'
-import { useServer } from '@/lib/server'
+import { useServer, isSameOrigin, isHostedEnvironment } from '@/lib/server'
 import { CopyBlock } from './ui'
 import { ServerConnectSteps } from './ServerConnectSteps'
 
@@ -17,7 +17,7 @@ export function ServerStatusBar({
   pending = false,
   onCancelPending,
 }: ServerStatusBarProps) {
-  const { state, status, connected, health, blockedOrigin, check } = useServer()
+  const { state, status, connected, health, base, blockedOrigin, setupRequired, backendError, check } = useServer()
   const [internalExpanded, setInternalExpanded] = useState(false)
   const [showFallbackButton, setShowFallbackButton] = useState(false)
   const [isChecking, setIsChecking] = useState(false)
@@ -74,6 +74,57 @@ export function ServerStatusBar({
   }
 
   const currentState = state || 'not-running'
+  const isSame = isSameOrigin(base)
+
+  if (isSame) {
+    let sameOriginMessage = 'Server unreachable (retrying…)'
+    if (currentState === 'setup-needed') {
+      sameOriginMessage = `Setup needed: ${setupRequired || health?.setup_required || 'Configuration required'}`
+    } else if (currentState === 'backend-error') {
+      sameOriginMessage = `Backend error: ${backendError ? `${backendError.status} ${backendError.reason}` : 'Server Error'}`
+    } else if (currentState === 'unreachable') {
+      sameOriginMessage = 'Server unreachable (retrying…)'
+    }
+
+    return (
+      <div className="rounded-xl border border-amber/30 bg-amber/10 p-2.5 text-xs text-amber space-y-2.5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="h-2 w-2 rounded-full bg-amber animate-pulse shrink-0" />
+            <span className="font-medium truncate">{sameOriginMessage}</span>
+            {pending && (
+              <span className="text-amber/90 truncate text-[0.7rem]">
+                — We&apos;ll start as soon as the server connects.
+              </span>
+            )}
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
+            {pending && onCancelPending && (
+              <button
+                type="button"
+                className="text-amber/80 hover:text-amber underline text-xs"
+                onClick={onCancelPending}
+              >
+                Cancel
+              </button>
+            )}
+            {currentState === 'backend-error' && (
+              <a
+                href={`${(base || '').replace(/\/+$/, '')}/api/health`}
+                target="_blank"
+                rel="noreferrer"
+                className="text-amber/80 hover:text-amber underline text-xs inline-flex items-center gap-1"
+              >
+                <span>Open the server status</span>
+                <ExternalLink size={10} />
+              </a>
+            )}
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   let message = 'Server not running'
   if (currentState === 'blocked-browser') {

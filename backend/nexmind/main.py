@@ -12,25 +12,32 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import asyncio
 from . import __version__
 from .api import chat_routes, connect, connect_script, events as events_api, graph_routes, workspaces, ws
 from .config import settings
+from .db import find_database_url
 from .events import hub
 from .ingest.files import IngestError
 from .owner import OwnerMiddleware
 from .rag.llm import LLM, get_llm, set_llm
-from .state import db
+from .state import db, get_db_status
 from .watcher import watcher
 
 logging.basicConfig(level=os.environ.get("NEXMIND_LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
 log = logging.getLogger("nexmind")
+
+# Cold-start log line: version, platform, which database variable is used (name only), Python version
+_init_url, _init_env_var = find_database_url()
+log.info("NexMind %s (platform=%s, db_env=%s, python=%s)", __version__, sys.platform, _init_env_var or "none", sys.version.split()[0])
 
 
 @asynccontextmanager
@@ -38,8 +45,9 @@ async def lifespan(app: FastAPI):
     hub.bind_loop(asyncio.get_running_loop())
     if settings.allow_local_paths and not settings.hosted:
         watcher.start()
-    log.info("NexMind %s ready (%s, storage=%s, hosted=%s, LLM=%s)", __version__,
-             "vercel" if settings.on_vercel else "local", db.dialect, settings.hosted, get_llm().info().get("provider"))
+    _, _, env_var, _ = get_db_status()
+    log.info("NexMind %s ready (%s, storage=%s, db_env=%s, hosted=%s, LLM=%s)", __version__,
+             "vercel" if settings.on_vercel else "local", db.dialect, env_var or "none", settings.hosted, get_llm().info().get("provider"))
     yield
     watcher.stop()
 
@@ -71,9 +79,23 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(OwnerMiddleware)
 
 
+def require_db():
+    ok, error_sentence, _, _ = get_db_status()
+    if not ok:
+        raise HTTPException(status_code=503, detail=error_sentence)
+
+
+db_dep = [Depends(require_db)]
+
+
 @app.exception_handler(IngestError)
 async def ingest_error_handler(_: Request, exc: IngestError):
     return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(_: Request, exc: StarletteHTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
 @app.exception_handler(Exception)
@@ -82,13 +104,14 @@ async def unexpected_error(_: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": "The server hit a problem. Try again; details are in the server log."})
 
 
-app.include_router(workspaces.router)
-app.include_router(graph_routes.router)
-app.include_router(chat_routes.router)
-app.include_router(events_api.router)
-app.include_router(connect.router)
+# Routers requiring working database
+app.include_router(workspaces.router, dependencies=db_dep)
+app.include_router(graph_routes.router, dependencies=db_dep)
+app.include_router(chat_routes.router, dependencies=db_dep)
+app.include_router(events_api.router, dependencies=db_dep)
+app.include_router(connect.router, dependencies=db_dep)
 app.include_router(connect_script.router)
-app.include_router(ws.router)
+app.include_router(ws.router, dependencies=db_dep)
 
 
 @app.get("/api/ping", tags=["system"])
@@ -98,20 +121,29 @@ def ping(request: Request) -> JSONResponse:
     return JSONResponse(content=data, headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Private-Network": "true"})
 
 
-def setup_problem() -> str | None:
-    if settings.hosted and not db.persistent and os.environ.get("NEXMIND_ALLOW_EPHEMERAL") != "1":
-        return ("Storage is not set up yet. In Vercel open Storage, add a Postgres database (Neon), connect it to this "
-                "project, then redeploy.")
-    return None
-
-
 @app.get("/api/health", tags=["system"])
 def health() -> dict:
+    ok, error_sentence, env_var, configured = get_db_status()
+    setup_req = error_sentence if not ok else None
+
+    ws_count = 0
+    if ok:
+        try:
+            ws_count = _workspace_count()
+        except Exception:
+            ws_count = 0
+
     return {
         "app": "nexmind", "status": "ok", "version": __version__,
         "hosted": settings.hosted, "platform_host": "vercel" if settings.on_vercel else "local",
         "storage": {"dialect": db.dialect, "persistent": db.persistent or not settings.hosted},
-        "setup_required": setup_problem(),
+        "database": {
+            "configured": configured,
+            "ok": ok,
+            "error": error_sentence,
+            "env_var": env_var,
+        },
+        "setup_required": setup_req,
         "capabilities": {"local_paths": settings.allow_local_paths, "git_token": True, "websocket": False, "events": True,
                          "sse_chat": True, "chunked_upload": True, "background_jobs": settings.background_jobs},
         "upload": {"chunk_bytes": int(settings.upload_chunk_mb * 1024 * 1024), "max_mb": settings.max_upload_mb},
@@ -121,7 +153,7 @@ def health() -> dict:
         "web_url": settings.web_url,
         "llm": get_llm().info(), "embeddings": settings.embeddings,
         "limits": {"max_upload_mb": settings.max_upload_mb, "max_files": settings.max_files, "git_hosts": settings.git_hosts},
-        "workspaces": _workspace_count(),
+        "workspaces": ws_count,
     }
 
 
@@ -141,12 +173,12 @@ class LLMIn(BaseModel):
     model: str | None = None
 
 
-@app.get("/api/llm", tags=["system"])
+@app.get("/api/llm", tags=["system"], dependencies=db_dep)
 def llm_info() -> dict:
     return {**get_llm().info(), "available_providers": ["offline", "anthropic", "openai", "ollama"]}
 
 
-@app.put("/api/llm", tags=["system"])
+@app.put("/api/llm", tags=["system"], dependencies=db_dep)
 def llm_switch(body: LLMIn):
     if settings.hosted:
         return JSONResponse(status_code=403, content={"detail": "The hosted app uses the model configured by its owner."})
@@ -154,6 +186,12 @@ def llm_switch(body: LLMIn):
         return JSONResponse(status_code=400, content={"detail": "provider must be offline | anthropic | openai | ollama"})
     set_llm(LLM(body.provider, body.model))
     return get_llm().info()
+
+
+# Unknown /api/* route handler: returns JSON 404 (never SPA HTML)
+@app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"], include_in_schema=False)
+def api_not_found(path: str):
+    return JSONResponse(status_code=404, content={"detail": "Not found"})
 
 
 # Local installs: serve the built web app from ./frontend_dist so http://127.0.0.1:8000 is the whole product.

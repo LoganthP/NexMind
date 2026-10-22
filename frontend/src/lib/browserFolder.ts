@@ -1,5 +1,5 @@
 import { api, getApiBase, authHeaders, ApiError, uploadChunkedFile } from './api'
-import { EXCLUDED_FOLDERS, shouldIncludeFile, packWithWorker } from './folderUpload'
+import { EXCLUDED_FOLDERS, BINARY_EXTS, shouldIncludeFile, packWithWorker } from './folderUpload'
 
 export interface FileEntryRecord {
   file: File
@@ -48,10 +48,16 @@ export function getBrowserPathHint(folderName: string): string {
   return `browser:${folderName}:${stableId}`
 }
 
+const MAX_LEAN_FILES = 5000
+const MAX_LEAN_BYTES = 60 * 1024 * 1024 // 60 MB
+const MAX_FILE_SIZE = 2 * 1024 * 1024 // 2 MB
+
 export async function walkDirectoryHandle(
   dirHandle: any,
-  currentPath = ''
+  currentPath = '',
+  stats?: { totalFiles: number; totalBytes: number }
 ): Promise<{ files: FileEntryRecord[]; skippedFolders: Set<string> }> {
+  const currentStats = stats || { totalFiles: 0, totalBytes: 0 }
   const files: FileEntryRecord[] = []
   const skippedFolders = new Set<string>()
 
@@ -65,21 +71,42 @@ export async function walkDirectoryHandle(
   if (iter) {
     for await (const item of iter) {
       const [name, handle] = Array.isArray(item) ? item : [item.name, item]
-      if (!name || name.startsWith('.')) continue
+      if (!name) continue
+      const lowerName = name.toLowerCase()
 
       if (handle.kind === 'directory') {
-        if (EXCLUDED_FOLDERS.has(name.toLowerCase())) {
+        // Skip ignored folders without opening them
+        if (EXCLUDED_FOLDERS.has(lowerName) || lowerName.startsWith('.')) {
           skippedFolders.add(name)
           continue
         }
         const subPath = currentPath ? `${currentPath}/${name}` : name
-        const sub = await walkDirectoryHandle(handle, subPath)
+        const sub = await walkDirectoryHandle(handle, subPath, currentStats)
         for (const f of sub.files) files.push(f)
         for (const s of sub.skippedFolders) skippedFolders.add(s)
       } else if (handle.kind === 'file') {
+        if (name.startsWith('.')) continue
+
+        const lastDot = name.lastIndexOf('.')
+        const ext = lastDot >= 0 ? lowerName.slice(lastDot) : ''
+        if (BINARY_EXTS.has(ext)) {
+          continue
+        }
+
         const file = await handle.getFile()
+        if (file.size > MAX_FILE_SIZE) {
+          continue
+        }
+
         const relativePath = currentPath ? `${currentPath}/${name}` : name
         if (shouldIncludeFile(relativePath, file.size, 'code')) {
+          currentStats.totalFiles++
+          currentStats.totalBytes += file.size
+
+          if (currentStats.totalFiles > MAX_LEAN_FILES || currentStats.totalBytes > MAX_LEAN_BYTES) {
+            throw new Error('Too large to upload: choose a sub-folder such as src, or analyze on this computer')
+          }
+
           files.push({ file, relativePath })
         }
       }

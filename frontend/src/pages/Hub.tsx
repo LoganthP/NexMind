@@ -21,7 +21,7 @@ export default function Hub() {
   const nav = useNavigate()
   const [items, setItems] = useState<Workspace[] | null>(null)
   const [tab, setTab] = useState<WorkspaceMode>('code')
-  const [dialog, setDialog] = useState<{ open: boolean; mode: WorkspaceMode | null }>({
+  const [dialog, setDialog] = useState<{ open: boolean; mode: WorkspaceMode | null; initialTab?: string }>({
     open: false,
     mode: null,
   })
@@ -36,6 +36,21 @@ export default function Hub() {
   const isOnline = serverStatus === 'online'
   const isOffline = serverStatus === 'offline'
   const settings = useSettings()
+
+  useEffect(() => {
+    const handleHash = () => {
+      const hash = window.location.hash
+      if (hash === '#new-local') {
+        setDialog({ open: true, mode: 'code', initialTab: 'local' })
+      } else if (hash === '#new-live') {
+        setDialog({ open: true, mode: 'live' })
+      }
+    }
+
+    handleHash()
+    window.addEventListener('hashchange', handleHash)
+    return () => window.removeEventListener('hashchange', handleHash)
+  }, [])
 
   useEffect(() => {
     if (!menu && !connectOpen) return
@@ -61,12 +76,17 @@ export default function Hub() {
     }
   }, [menu, connectOpen])
 
-  const openDialog = (mode?: WorkspaceMode) => {
-    setDialog({ open: true, mode: mode ?? null })
+  const openDialog = (mode?: WorkspaceMode, initialTab?: string) => {
+    setDialog({ open: true, mode: mode ?? null, initialTab })
   }
 
   const closeDialog = () => {
-    setDialog({ open: false, mode: null })
+    setDialog({ open: false, mode: null, initialTab: undefined })
+    if (typeof window !== 'undefined' && (window.location.hash === '#new-local' || window.location.hash === '#new-live')) {
+      try {
+        history.replaceState(null, '', window.location.pathname + window.location.search)
+      } catch {}
+    }
   }
 
   const load = () =>
@@ -161,7 +181,7 @@ export default function Hub() {
           {isOnline ? (
             <span className="chip">
               <i className="pulse-dot !h-1.5 !w-1.5" /> Server {health?.version} ·{' '}
-              {health?.llm.available ? health.llm.provider : 'offline answers'}
+              {health?.llm?.available ? health.llm.provider : 'offline answers'}
             </span>
           ) : (
             <div className="relative" ref={connectRef}>
@@ -477,6 +497,7 @@ export default function Hub() {
       {dialog.open && (
         <NewWorkspaceDialog
           initialMode={dialog.mode}
+          initialTab={dialog.initialTab}
           onClose={closeDialog}
         />
       )}

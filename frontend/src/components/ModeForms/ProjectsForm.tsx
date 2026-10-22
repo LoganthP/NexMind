@@ -3,6 +3,7 @@ import {
   AlertCircle,
   Archive,
   Code2,
+  ExternalLink,
   Folder,
   FolderOpen,
   FolderUp,
@@ -11,13 +12,18 @@ import {
   GitPullRequest,
   KeyRound,
   Loader2,
+  RefreshCw,
   RotateCcw,
   Sparkles,
   UploadCloud,
   X,
 } from 'lucide-react'
 import { api, formatApiError, uploadFiles } from '@/lib/api'
-import { useServer, isLocalPathsSupported } from '@/lib/server'
+import { useServer, isLocalPathsSupported, isHostedEnvironment } from '@/lib/server'
+import { probeLocalServer } from '@/lib/localServer'
+import { detectOS } from '@/lib/os'
+import { CopyBlock } from '../ui'
+import { computeHandleSignature } from '@/lib/browserFolder'
 import { packFolder, getFilesFromDataTransfer, packWithWorker, type PackFolderResult } from '@/lib/folderUpload'
 import type { FsCheckResult } from '@/lib/types'
 import { FolderPicker } from '../FolderPicker'
@@ -27,6 +33,7 @@ import { ServerStatusBar } from '../ServerStatusBar'
 interface ProjectsFormProps {
   onStarted?: (jobId: string, workspaceId: string) => void
   workspaceId?: string
+  initialTab?: Tab
 }
 
 type Tab = 'github' | 'gitlab' | 'azure' | 'upload' | 'local'
@@ -78,10 +85,10 @@ function formatBytes(bytes: number): string {
   return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`
 }
 
-export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
+export function ProjectsForm({ onStarted, workspaceId, initialTab }: ProjectsFormProps) {
   const { status, health, check } = useServer()
-  // A hosted NexMind (e.g. Vercel) cannot open folders on your computer: upload the folder instead.
-  const localOk = useServer((st) => isLocalPathsSupported(st))
+  const isHosted = isHostedEnvironment()
+  const localOk = useServer((st) => isLocalPathsSupported(st)) && !isHosted
   const isOnline = status === 'online'
 
   useEffect(() => {
@@ -92,13 +99,58 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
     return () => clearInterval(id)
   }, [health?.setup_required, check])
 
-  const [tab, setTab] = useState<Tab>('github')
+  const [tab, setTab] = useState<Tab>(() => initialTab || 'github')
+
+  useEffect(() => {
+    if (initialTab) {
+      setTab(initialTab)
+    }
+  }, [initialTab])
+
   const [url, setUrl] = useState('')
   const [branch, setBranch] = useState('')
   const [token, setToken] = useState('')
   const [path, setPath] = useState('')
   const [name, setName] = useState('')
   const [files, setFiles] = useState<File[]>([])
+
+  // Local server detection on hosted site
+  const [localServer, setLocalServer] = useState<{
+    probing: boolean
+    detected: boolean
+    url: string | null
+  }>({
+    probing: false,
+    detected: false,
+    url: null,
+  })
+  const [showUploadFallback, setShowUploadFallback] = useState(false)
+
+  const probeLocal = useCallback(async (isUserGesture = false) => {
+    setLocalServer((prev) => ({ ...prev, probing: true }))
+    try {
+      const res = await probeLocalServer(isUserGesture)
+      setLocalServer({
+        probing: false,
+        detected: res.running,
+        url: res.url,
+      })
+      return res
+    } catch {
+      setLocalServer({
+        probing: false,
+        detected: false,
+        url: null,
+      })
+      return { running: false, port: null, url: null }
+    }
+  }, [])
+
+  useEffect(() => {
+    if (tab === 'local' && isHosted) {
+      void probeLocal(false)
+    }
+  }, [tab, isHosted, probeLocal])
 
   // FolderReview state
   const [reviewFiles, setReviewFiles] = useState<File[] | null>(null)
@@ -304,6 +356,56 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
     setReviewFolderName(folderName)
     setReviewSourceTab('upload')
     if (!name) setName(folderName)
+  }
+
+  const os = detectOS()
+  const repoUrl =
+    (typeof import.meta !== 'undefined' &&
+      ((import.meta as any).env?.VITE_BACKEND_REPO_URL || (import.meta as any).env?.VITE_REPO_URL)) ||
+    'https://github.com/LoganthP/NexMind'
+
+  const startCmd =
+    os === 'windows'
+      ? 'powershell -ExecutionPolicy Bypass -File .\\start.ps1'
+      : './start.sh'
+
+  const handlePickDirectoryHandle = async () => {
+    setError(null)
+    if (typeof (window as any).showDirectoryPicker !== 'function') {
+      setError(
+        'Your browser does not support folder selection without reading dependencies. Use Chrome or Edge, or analyze on this computer.'
+      )
+      return
+    }
+    try {
+      const handle = await (window as any).showDirectoryPicker()
+      const folderName = handle.name || 'project'
+      setLocalFolderName(folderName)
+      setReviewFolderName(folderName)
+
+      const walkRes = await computeHandleSignature(handle)
+      const fileList = walkRes.files.map((rec) => {
+        const f = rec.file
+        try {
+          Object.defineProperty(f, 'webkitRelativePath', {
+            value: rec.relativePath,
+            writable: true,
+            configurable: true,
+          })
+        } catch {}
+        return f
+      })
+      if (fileList.length === 0) {
+        setError('This folder has no source files we can analyze')
+        return
+      }
+      setReviewFiles(fileList)
+      setReviewSourceTab('local')
+      if (!name) setName(folderName)
+    } catch (err: any) {
+      if (err?.name === 'AbortError') return
+      setError(err?.message || 'Failed to select folder')
+    }
   }
 
   const handleHostedFolderPick = async (folderFiles: FileList | File[]) => {
@@ -553,7 +655,13 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
                 <button
                   type="button"
                   className="btn btn-ghost btn-sm flex items-center gap-1.5 !h-8 !px-3"
-                  onClick={() => folderInputRef.current?.click()}
+                  onClick={() => {
+                    if (isHosted) {
+                      void handlePickDirectoryHandle()
+                    } else {
+                      folderInputRef.current?.click()
+                    }
+                  }}
                   disabled={packing}
                 >
                   {packing ? (
@@ -577,19 +685,21 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
                   }}
                 />
 
-                <input
-                  ref={folderInputRef}
-                  type="file"
-                  multiple
-                  hidden
-                  {...({ webkitdirectory: '', directory: '' } as any)}
-                  onChange={(e) => {
-                    if (e.target.files && e.target.files.length > 0) {
-                      void handleFolderUpload(e.target.files)
-                    }
-                    e.target.value = ''
-                  }}
-                />
+                {!isHosted && (
+                  <input
+                    ref={folderInputRef}
+                    type="file"
+                    multiple
+                    hidden
+                    {...({ webkitdirectory: '', directory: '' } as any)}
+                    onChange={(e) => {
+                      if (e.target.files && e.target.files.length > 0) {
+                        void handleFolderUpload(e.target.files)
+                      }
+                      e.target.value = ''
+                    }}
+                  />
+                )}
               </div>
 
               {packNote && (
@@ -715,78 +825,129 @@ export function ProjectsForm({ onStarted, workspaceId }: ProjectsFormProps) {
                   onConfirm={handleConfirmReview}
                   onChangeFolder={() => {
                     setReviewFiles(null)
-                    setTimeout(() => localFolderInputRef.current?.click(), 0)
+                    void handlePickDirectoryHandle()
                   }}
                   disabled={Boolean(health?.setup_required)}
                 />
-              ) : (
-                <div
-                  onDragOver={(e) => {
-                    e.preventDefault()
-                    setLocalDragOver(true)
-                  }}
-                  onDragLeave={() => setLocalDragOver(false)}
-                  onDrop={async (e) => {
-                    e.preventDefault()
-                    setLocalDragOver(false)
-                    if (e.dataTransfer) {
-                      const dropped = await getFilesFromDataTransfer(e.dataTransfer)
-                      if (dropped.length > 0) {
-                        void handleHostedFolderPick(dropped)
-                      }
-                    }
-                  }}
-                  className={`relative flex flex-col items-center justify-center rounded-2xl border-2 border-dashed p-6 text-center transition-all ${
-                    localDragOver
-                      ? 'border-plankton bg-plankton/10'
-                      : 'border-white/10 bg-white/[0.02] hover:border-white/20 hover:bg-white/[0.03]'
-                  }`}
-                >
-                  <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-plankton/10 text-plankton mb-3">
+              ) : localServer.detected ? (
+                <div className="rounded-2xl border border-plankton/30 bg-plankton/5 p-5 text-center space-y-3">
+                  <div className="flex h-12 w-12 mx-auto items-center justify-center rounded-2xl bg-plankton/10 text-plankton">
                     <FolderOpen size={24} />
                   </div>
+                  <p className="text-sm font-semibold text-ink">
+                    NexMind is running on this computer: analyze the folder in place (fastest, nothing is uploaded)
+                  </p>
+                  <p className="text-xs text-mist max-w-[46ch] mx-auto">
+                    The local server indexes your files in place. Nothing is uploaded to the cloud.
+                  </p>
+                  <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-2.5">
+                    <a
+                      href={`${localServer.url || 'http://127.0.0.1:8000'}/app#new-local`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="btn btn-primary btn-sm !h-9 !px-4 text-xs font-semibold inline-flex items-center gap-1.5"
+                    >
+                      <FolderOpen size={15} />
+                      <span>Analyze on this computer</span>
+                    </a>
+                  </div>
+                  <div className="pt-2">
+                    <button
+                      type="button"
+                      className="text-xs text-mist hover:text-ink underline"
+                      onClick={() => setShowUploadFallback(true)}
+                    >
+                      Upload instead (slower)
+                    </button>
+                  </div>
+                </div>
+              ) : !showUploadFallback ? (
+                <div className="rounded-2xl border hair bg-black/20 p-5 space-y-4">
+                  <div className="space-y-1">
+                    <h3 className="text-sm font-semibold text-ink">
+                      Analyze a folder from this computer
+                    </h3>
+                    <p className="text-xs text-mist leading-relaxed">
+                      To analyze code directly on your computer without uploading files, run the local NexMind server.
+                    </p>
+                  </div>
 
+                  <div className="space-y-3 text-xs">
+                    <div className="space-y-1.5">
+                      <span className="font-medium text-ink">1. Download or clone NexMind</span>
+                      <div>
+                        <a
+                          href={repoUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 text-plankton hover:underline font-medium"
+                        >
+                          <span>Download or clone NexMind</span>
+                          <ExternalLink size={13} />
+                        </a>
+                      </div>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <span className="font-medium text-ink">2. In the backend folder run:</span>
+                      <CopyBlock
+                        label={os === 'windows' ? 'PowerShell' : 'Terminal'}
+                        command={startCmd}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="pt-1 flex flex-wrap items-center justify-between gap-3 border-t hair">
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-sm !h-8 !px-3 text-xs flex items-center gap-1.5 font-medium"
+                      disabled={localServer.probing}
+                      onClick={() => probeLocal(true)}
+                    >
+                      {localServer.probing ? (
+                        <Loader2 size={13} className="animate-spin text-plankton" />
+                      ) : (
+                        <RefreshCw size={13} className="text-plankton" />
+                      )}
+                      <span>{localServer.probing ? 'Checking…' : 'Check again'}</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      className="text-xs text-mist hover:text-ink underline"
+                      onClick={() => setShowUploadFallback(true)}
+                    >
+                      Upload instead (slower)
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="rounded-2xl border-2 border-dashed border-white/10 bg-white/[0.02] p-6 text-center space-y-3">
+                  <div className="flex h-12 w-12 mx-auto items-center justify-center rounded-2xl bg-plankton/10 text-plankton mb-1">
+                    <FolderOpen size={24} />
+                  </div>
                   <p className="text-sm font-medium text-ink">
                     Choose a project folder
                   </p>
-                  <p className="mt-1 text-xs text-mist max-w-[46ch] leading-relaxed">
-                    Pick your project folder (or just its src folder). Your browser packs the source files and uploads them; nothing else on your computer is read.
+                  <p className="text-xs text-mist max-w-[46ch] mx-auto leading-relaxed">
+                    Pick your project folder (or just its src folder). Dependencies such as node_modules and .git are skipped without being read.
                   </p>
-
-                  <div className="mt-4 flex flex-wrap items-center justify-center gap-2.5">
-                    {canPickFolder ? (
-                      <button
-                        type="button"
-                        className="btn btn-primary btn-sm flex items-center gap-1.5 !h-9 !px-4 text-xs font-semibold"
-                        onClick={() => localFolderInputRef.current?.click()}
-                        disabled={packingLocal}
-                      >
-                        {packingLocal ? (
-                          <Loader2 size={15} className="animate-spin text-ink" />
-                        ) : (
-                          <FolderOpen size={15} className="text-ink" />
-                        )}
-                        <span>{packingLocal ? 'Packing folder…' : 'Choose folder…'}</span>
-                      </button>
-                    ) : (
-                      <p className="text-xs text-amber">
-                        Your browser cannot pick folders; zip the folder and use Upload project instead.
-                      </p>
-                    )}
-
-                    <input
-                      ref={localFolderInputRef}
-                      type="file"
-                      multiple
-                      hidden
-                      {...({ webkitdirectory: '', directory: '' } as any)}
-                      onChange={(e) => {
-                        if (e.target.files && e.target.files.length > 0) {
-                          void handleHostedFolderPick(e.target.files)
-                        }
-                        e.target.value = ''
-                      }}
-                    />
+                  <div className="pt-2 flex flex-col items-center justify-center gap-2">
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-sm flex items-center gap-1.5 !h-9 !px-4 text-xs font-semibold"
+                      onClick={handlePickDirectoryHandle}
+                    >
+                      <FolderOpen size={15} className="text-ink" />
+                      <span>Choose folder…</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="text-xs text-mist hover:text-ink underline mt-2"
+                      onClick={() => setShowUploadFallback(false)}
+                    >
+                      Analyze on this computer instead
+                    </button>
                   </div>
                 </div>
               )}

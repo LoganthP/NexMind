@@ -13,6 +13,7 @@ import {
 } from 'lucide-react'
 import { api, formatApiError, ApiError, getApiBase } from '@/lib/api'
 import { useServer, isLocalPathsSupported, isHostedEnvironment } from '@/lib/server'
+import { probeLocalServer } from '@/lib/localServer'
 import { connectScriptUrl, detectOS, type OS } from '@/lib/os'
 import { CopyBlock, Spinner, Switch } from './ui'
 import { FolderPicker } from './FolderPicker'
@@ -39,6 +40,30 @@ export function ConnectPanel({ onSuccess, onClose }: Props) {
   const isHosted = isHostedEnvironment()
   const localOk = useServer((st) => isLocalPathsSupported(st)) && !isHosted
   const isOnline = status === 'online'
+
+  const [localServer, setLocalServer] = useState<{
+    probing: boolean
+    detected: boolean
+    url: string | null
+  }>({
+    probing: false,
+    detected: false,
+    url: null,
+  })
+  const [showBrowserSyncFallback, setShowBrowserSyncFallback] = useState(false)
+
+  useEffect(() => {
+    if (isHosted) {
+      setLocalServer((prev) => ({ ...prev, probing: true }))
+      probeLocalServer(false).then((res) => {
+        setLocalServer({
+          probing: false,
+          detected: res.running,
+          url: res.url,
+        })
+      })
+    }
+  }, [isHosted])
 
   const [os, setOs] = useState<OS>(detectOS())
   const [connectedSession, setConnectedSession] = useState<{
@@ -570,6 +595,35 @@ export function ConnectPanel({ onSuccess, onClose }: Props) {
               </button>
             </div>
           </div>
+        ) : localServer.detected && !showBrowserSyncFallback ? (
+          <div className="rounded-xl border border-coral/30 bg-coral/5 p-4 space-y-2.5 text-center">
+            <p className="text-sm font-semibold text-ink">
+              NexMind is running on this computer
+            </p>
+            <p className="text-xs text-mist max-w-[46ch] mx-auto">
+              Connect directly on your computer to watch changes in place with zero network uploads.
+            </p>
+            <div className="pt-1">
+              <a
+                href={`${localServer.url || 'http://127.0.0.1:8000'}/app#new-live`}
+                target="_blank"
+                rel="noreferrer"
+                className="btn btn-primary btn-sm !h-9 !px-4 text-xs font-semibold inline-flex items-center gap-1.5"
+              >
+                <Terminal size={14} />
+                <span>Connect on this computer instead</span>
+              </a>
+            </div>
+            <div className="pt-2">
+              <button
+                type="button"
+                className="text-xs text-mist hover:text-ink underline"
+                onClick={() => setShowBrowserSyncFallback(true)}
+              >
+                Sync from browser instead (slower)
+              </button>
+            </div>
+          </div>
         ) : (
           <div className="space-y-3">
             {reviewFiles ? (
@@ -683,6 +737,18 @@ export function ConnectPanel({ onSuccess, onClose }: Props) {
                   <p className="text-[0.72rem] text-mist leading-relaxed px-1">
                     Live sync from the browser needs Chrome or Edge. For automatic sync in any browser, use the terminal command above.
                   </p>
+                )}
+
+                {localServer.detected && showBrowserSyncFallback && (
+                  <div className="text-center pt-2">
+                    <button
+                      type="button"
+                      className="text-xs text-mist hover:text-ink underline"
+                      onClick={() => setShowBrowserSyncFallback(false)}
+                    >
+                      Connect on this computer instead
+                    </button>
+                  </div>
                 )}
               </>
             )}

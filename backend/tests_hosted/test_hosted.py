@@ -362,3 +362,78 @@ def test_upload_resume_manifest_delta_and_isolation(client):
         "deleted": [],
     }, headers=H(KEY_B))
     assert res_src_delta_b.status_code in (403, 404)
+
+
+def test_prefixed_database_env_vars():
+    from nexmind.db import find_database_url
+
+    old_env = dict(os.environ)
+    try:
+        # Clear known DB vars
+        for k in ("NEXMIND_DATABASE_URL", "DATABASE_URL", "POSTGRES_URL", "POSTGRES_PRISMA_URL", "DATABASE_URL_UNPOOLED"):
+            os.environ.pop(k, None)
+        for k in list(os.environ.keys()):
+            if k.endswith(("_DATABASE_URL", "_POSTGRES_URL")):
+                os.environ.pop(k, None)
+
+        # Prefixed variable
+        os.environ["STORAGE_DATABASE_URL"] = "postgresql://user:pass@ep-cool.neon.tech/neondb"
+        url, env_name = find_database_url()
+        assert env_name == "STORAGE_DATABASE_URL"
+        assert "ep-cool.neon.tech" in (url or "")
+
+        # Prefer pooler
+        os.environ["STORAGE_POSTGRES_URL"] = "postgresql://user:pass@ep-cool-pooler.neon.tech/neondb"
+        url2, env_name2 = find_database_url()
+        assert env_name2 == "STORAGE_POSTGRES_URL"
+        assert "-pooler" in (url2 or "")
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+
+
+def test_closed_port_database_url_health_and_503_and_recovery(client):
+    old_env = dict(os.environ)
+    try:
+        # Set database URL to a closed port with credentials
+        bad_pw = "super_secret_pw_xyz"
+        os.environ["DATABASE_URL"] = f"postgresql://user:{bad_pw}@127.0.0.1:54321/nonexistent_db?connect_timeout=2"
+        # Health always returns 200 JSON
+        r = client.get("/api/health")
+        assert r.status_code == 200
+        h = r.json()
+        assert h["database"]["configured"] is True
+        assert h["database"]["ok"] is False
+        assert h["database"]["env_var"] == "DATABASE_URL"
+        assert "Database unreachable: check DATABASE_URL" in (h["database"]["error"] or "")
+        assert h["setup_required"] == h["database"]["error"]
+        # Credentials must NEVER appear in health output
+        assert bad_pw not in json.dumps(h)
+
+        # Other API routes return 503 JSON with the same readable message
+        r_ws = client.get("/api/workspaces", headers=H(KEY_A))
+        assert r_ws.status_code == 503
+        assert r_ws.headers["content-type"].startswith("application/json")
+        assert r_ws.json()["detail"] == h["database"]["error"]
+
+        # Unknown route still returns 404 JSON
+        r_404 = client.get("/api/nonexistent_route_123")
+        assert r_404.status_code == 404
+        assert r_404.headers["content-type"].startswith("application/json")
+
+        # Switch URL back to working state (or ephemeral for tests)
+        # Verify subsequent request recovers without restarting
+        os.environ.pop("DATABASE_URL", None)
+        os.environ["NEXMIND_ALLOW_EPHEMERAL"] = "1"
+        r_recovered = client.get("/api/health")
+        assert r_recovered.status_code == 200
+        assert r_recovered.json()["database"]["ok"] is True
+        assert r_recovered.json()["setup_required"] is None
+
+        # Workspaces route now works
+        r_ws_ok = client.get("/api/workspaces", headers=H(KEY_A))
+        assert r_ws_ok.status_code == 200
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+

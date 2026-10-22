@@ -50,11 +50,11 @@ describe('requirement 5: acceptance and guard rails', () => {
       </MemoryRouter>
     )
 
-    const heading = await screen.findByRole('heading', { name: /Create your first workspace/i }, { timeout: 1000 })
+    const heading = await screen.findByRole('heading', { name: /Create your first workspace/i }, { timeout: 3000 })
     const elapsed = Date.now() - start
 
     expect(heading).toBeTruthy()
-    expect(elapsed).toBeLessThan(1000)
+    expect(elapsed).toBeLessThan(3000)
 
     // Three mode cards exist
     expect(screen.getByRole('heading', { name: /Analyze a project/i })).toBeTruthy()

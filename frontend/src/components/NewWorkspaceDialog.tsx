@@ -10,6 +10,7 @@ export type WorkspaceMode = 'code' | 'docs' | 'live'
 
 interface Props {
   initialMode?: WorkspaceMode | null
+  initialTab?: string
   onClose: () => void
 }
 
@@ -53,7 +54,7 @@ const MODES: ModeCard[] = [
   },
 ]
 
-export function NewWorkspaceDialog({ initialMode = null, onClose }: Props) {
+export function NewWorkspaceDialog({ initialMode = null, initialTab, onClose }: Props) {
   const nav = useNavigate()
   const [step, setStep] = useState<1 | 2>(() => (initialMode ? 2 : 1))
   const [mode, setMode] = useState<WorkspaceMode>(() => initialMode || 'code')
@@ -242,6 +243,7 @@ export function NewWorkspaceDialog({ initialMode = null, onClose }: Props) {
           <div className="py-2">
             {mode === 'code' && (
               <ProjectsForm
+                initialTab={initialTab as any}
                 onStarted={(_jobId, wsId) => {
                   onClose()
                   nav(`/app/w/${wsId}`)

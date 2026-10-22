@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "build:local": "node scripts/build-local.mjs",
     "postbuild": "npm run check:forbidden",
     "check:forbidden": "node scripts/check-forbidden.mjs",
     "typecheck": "tsc --noEmit",

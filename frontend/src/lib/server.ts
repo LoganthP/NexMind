@@ -9,6 +9,9 @@ export type ConnectionState =
   | 'blocked-origin'
   | 'outdated'
   | 'other-app'
+  | 'setup-needed'
+  | 'backend-error'
+  | 'unreachable'
 
 export interface ServerState {
   state: ConnectionState
@@ -19,6 +22,8 @@ export interface ServerState {
   lastCheckedAt: number | null
   blockedOrigin: string | null
   health: Health | null
+  setupRequired: string | null
+  backendError: { status: number; reason: string } | null
   localPaths: boolean
   attempts: number
   check: (timeoutMsOrGesture?: number | boolean, isUserGesture?: boolean) => Promise<boolean>
@@ -30,6 +35,8 @@ export interface ProbeResult {
   base: string
   health?: Health | null
   origin?: string | null
+  setupRequired?: string | null
+  backendError?: { status: number; reason: string } | null
 }
 
 const LAST_HEALTH_KEY = 'nexmind.lastHealth'
@@ -144,9 +151,28 @@ export function supportsTargetAddressSpace(): boolean {
   return false
 }
 
+export function isSameOrigin(url: string): boolean {
+  if (typeof window === 'undefined' || !window.location) return false
+  try {
+    const parsed = new URL(url, window.location.href)
+    if (parsed.origin.toLowerCase() !== window.location.origin.toLowerCase()) {
+      return false
+    }
+    const host = parsed.hostname.toLowerCase()
+    const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '::1'
+    return !isLocal || isHostedEnvironment()
+  } catch {
+    return false
+  }
+}
+
 export function getProbeCandidates(): string[] {
   const saved = getApiBase()
   const same = sameOriginBase()
+  if (isHostedEnvironment()) {
+    const list = [same, saved].filter(Boolean) as string[]
+    return Array.from(new Set(list.map((u) => u.replace(/\/+$/, ''))))
+  }
   const defaults = [
     ...(same ? [same] : []),
     'http://127.0.0.1:8000',
@@ -160,7 +186,7 @@ export function getProbeCandidates(): string[] {
 export async function probeCandidate(
   base: string,
   timeoutMs: number,
-  isUserGesture: boolean
+  isUserGesture = false
 ): Promise<ProbeResult> {
   const cleanBase = base.replace(/\/+$/, '')
 
@@ -189,6 +215,23 @@ export async function probeCandidate(
     }
   }
 
+  const isSame = isSameOrigin(cleanBase)
+
+  const extractShortReason = async (res: Response): Promise<string> => {
+    let shortReason = res.statusText || 'Server Error'
+    try {
+      const text = await res.text()
+      try {
+        const j = JSON.parse(text)
+        if (typeof j.detail === 'string') return j.detail
+      } catch {
+        const match = text.match(/<title>([^<]+)<\/title>/i)
+        if (match && match[1]) return match[1].trim()
+      }
+    } catch {}
+    return shortReason
+  }
+
   const tryNoCors = async (path = '/api/ping'): Promise<ProbeResult> => {
     try {
       await fetchWithTimeout(`${cleanBase}${path}`, buildFetchOpts('no-cors'))
@@ -203,8 +246,22 @@ export async function probeCandidate(
   try {
     pingRes = await fetchWithTimeout(`${cleanBase}/api/ping`, buildFetchOpts())
   } catch {
-    // b) If a) fails with a network/CORS error, try fetch(<base>/api/ping, { mode: 'no-cors' })
+    // For same-origin (hosted site): never classify failure as browser blocking
+    if (isSame) {
+      return { state: 'unreachable', base: cleanBase }
+    }
+    // b) For local server: try fetch(<base>/api/ping, { mode: 'no-cors' })
     return await tryNoCors('/api/ping')
+  }
+
+  // If 5xx on ping for same-origin
+  if (pingRes.status >= 500 && isSame) {
+    const reason = await extractShortReason(pingRes)
+    return {
+      state: 'backend-error',
+      base: cleanBase,
+      backendError: { status: pingRes.status, reason },
+    }
   }
 
   // c) If /api/ping returns 404, fall back to /api/health with CORS
@@ -216,9 +273,24 @@ export async function probeCandidate(
         try {
           h = await healthRes.json()
         } catch {
+          if (isSame) {
+            return {
+              state: 'backend-error',
+              base: cleanBase,
+              backendError: { status: healthRes.status, reason: 'Invalid JSON' },
+            }
+          }
           return { state: 'other-app', base: cleanBase }
         }
         if (h && h.app === 'nexmind') {
+          if (h.setup_required && isSame) {
+            return {
+              state: 'setup-needed',
+              base: cleanBase,
+              health: h,
+              setupRequired: h.setup_required,
+            }
+          }
           if (!h.capabilities) {
             return { state: 'outdated', health: h, base: cleanBase }
           }
@@ -226,15 +298,34 @@ export async function probeCandidate(
         }
         return { state: 'other-app', base: cleanBase }
       } else {
+        if (isSame) {
+          const reason = await extractShortReason(healthRes)
+          return {
+            state: 'backend-error',
+            base: cleanBase,
+            backendError: { status: healthRes.status, reason },
+          }
+        }
         return await tryNoCors('/api/health')
       }
     } catch {
+      if (isSame) {
+        return { state: 'unreachable', base: cleanBase }
+      }
       return await tryNoCors('/api/health')
     }
   }
 
   // If response status is not ok
   if (!pingRes.ok) {
+    if (isSame) {
+      const reason = await extractShortReason(pingRes)
+      return {
+        state: 'backend-error',
+        base: cleanBase,
+        backendError: { status: pingRes.status, reason },
+      }
+    }
     try {
       const j = await pingRes.json()
       if (j && j.app === 'nexmind') {
@@ -254,6 +345,13 @@ export async function probeCandidate(
   try {
     pingData = await pingRes.json()
   } catch {
+    if (isSame) {
+      return {
+        state: 'backend-error',
+        base: cleanBase,
+        backendError: { status: pingRes.status, reason: 'Invalid JSON' },
+      }
+    }
     return { state: 'other-app', base: cleanBase }
   }
 
@@ -275,14 +373,45 @@ export async function probeCandidate(
   try {
     const healthRes = await fetchWithTimeout(`${cleanBase}/api/health`, buildFetchOpts())
     if (healthRes.ok) {
-      const h = await healthRes.json()
+      let h: any = null
+      try {
+        h = await healthRes.json()
+      } catch {
+        if (isSame) {
+          return {
+            state: 'backend-error',
+            base: cleanBase,
+            backendError: { status: healthRes.status, reason: 'Invalid JSON' },
+          }
+        }
+        return { state: 'other-app', base: cleanBase }
+      }
       if (h && h.app === 'nexmind') {
+        if (h.setup_required && isSame) {
+          return {
+            state: 'setup-needed',
+            base: cleanBase,
+            health: h,
+            setupRequired: h.setup_required,
+          }
+        }
         return { state: 'connected', health: h, base: cleanBase }
       }
       return { state: 'other-app', base: cleanBase }
     }
+    if (isSame) {
+      const reason = await extractShortReason(healthRes)
+      return {
+        state: 'backend-error',
+        base: cleanBase,
+        backendError: { status: healthRes.status, reason },
+      }
+    }
     return { state: 'outdated', base: cleanBase }
   } catch {
+    if (isSame) {
+      return { state: 'unreachable', base: cleanBase }
+    }
     return { state: 'outdated', base: cleanBase }
   }
 }
@@ -301,6 +430,8 @@ export const useServer = create<ServerState>((set, get) => {
     lastCheckedAt: null,
     blockedOrigin: null,
     health: initialHealth,
+    setupRequired: null,
+    backendError: null,
     localPaths: isHostedEnvironment() ? false : (initialHealth?.capabilities?.local_paths ?? true),
     attempts: 0,
     check: async (timeoutMsOrGesture?: number | boolean, isUserGesture?: boolean) => {
@@ -344,6 +475,8 @@ export const useServer = create<ServerState>((set, get) => {
                 connected: true,
                 base: res.base,
                 health: res.health || null,
+                setupRequired: null,
+                backendError: null,
                 localPaths: isLocalPathsSupported({ health: res.health } as any),
                 failingAddress: null,
                 blockedOrigin: null,
@@ -361,12 +494,15 @@ export const useServer = create<ServerState>((set, get) => {
           }
 
           const failurePriority: Record<ConnectionState, number> = {
-            'blocked-origin': 1,
-            'blocked-browser': 2,
-            'outdated': 3,
-            'other-app': 4,
-            'not-running': 5,
-            'connected': 6,
+            'setup-needed': 1,
+            'backend-error': 2,
+            'unreachable': 3,
+            'blocked-origin': 4,
+            'blocked-browser': 5,
+            'outdated': 6,
+            'other-app': 7,
+            'not-running': 8,
+            'connected': 9,
           }
           failures.sort((a, b) => failurePriority[a.state] - failurePriority[b.state])
           const best = failures[0] || { state: 'not-running', base: candidates[0] || DEFAULT_API }
@@ -380,7 +516,7 @@ export const useServer = create<ServerState>((set, get) => {
 
           const shouldDebounceOffline =
             wasOnline &&
-            best.state === 'not-running' &&
+            (best.state === 'not-running' || best.state === 'unreachable') &&
             !userGesture &&
             (isHostedEnvironment() || isActivityInProgress())
 
@@ -397,7 +533,9 @@ export const useServer = create<ServerState>((set, get) => {
             state: best.state,
             status: 'offline',
             connected: false,
-            health: null,
+            health: best.health || null,
+            setupRequired: best.setupRequired || null,
+            backendError: best.backendError || null,
             localPaths: isLocalPathsSupported({ health: null } as any),
             failingAddress: best.base,
             blockedOrigin: best.origin || null,
@@ -433,6 +571,8 @@ export const useServer = create<ServerState>((set, get) => {
           connected: true,
           base: clean,
           health: res.health || null,
+          setupRequired: null,
+          backendError: null,
           localPaths: isLocalPathsSupported({ health: res.health } as any),
           failingAddress: null,
           blockedOrigin: null,
@@ -450,7 +590,9 @@ export const useServer = create<ServerState>((set, get) => {
         state: res.state,
         status: 'offline',
         connected: false,
-        health: null,
+        health: res.health || null,
+        setupRequired: res.setupRequired || null,
+        backendError: res.backendError || null,
         localPaths: isLocalPathsSupported({ health: null } as any),
         failingAddress: clean,
         blockedOrigin: res.origin || null,

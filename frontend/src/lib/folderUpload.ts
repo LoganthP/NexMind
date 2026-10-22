@@ -49,7 +49,7 @@ const DOC_EXTS = new Set([
   '.tar.gz',
 ])
 
-const BINARY_EXTS = new Set([
+export const BINARY_EXTS = new Set([
   '.png',
   '.jpg',
   '.jpeg',

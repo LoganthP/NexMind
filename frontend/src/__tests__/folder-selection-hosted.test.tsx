@@ -118,26 +118,43 @@ describe('Folder Selection on Hosted / Vercel Backend', () => {
     expect(localTab).toBeTruthy()
     fireEvent.click(localTab)
 
-    // Has "Choose folder…" button and NO path text field
-    expect(screen.getByRole('button', { name: /Choose folder…/i })).toBeTruthy()
+    // Shows start instructions and NO path text field
+    expect(screen.getByText('Download or clone NexMind')).toBeTruthy()
     expect(screen.queryByPlaceholderText(/C:\\Users/i)).toBeNull()
+    expect(screen.getByRole('button', { name: /Upload instead \(slower\)/i })).toBeTruthy()
 
-    // Pick a valid code file list with webkitRelativePath
-    const validFile = new File(['export const hello = "world"'], 'index.ts', {
-      type: 'text/typescript',
-    })
-    Object.defineProperty(validFile, 'webkitRelativePath', {
-      value: 'my-cool-app/src/index.ts',
-    })
+    // Upload fallback never creates an input[webkitdirectory] on hosted origin
+    expect(container.querySelector('input[webkitdirectory]')).toBeNull()
 
-    const fileInput = container.querySelector('input[type="file"][webkitdirectory]') as HTMLInputElement
-    expect(fileInput).toBeTruthy()
+    // Click "Upload instead (slower)"
+    fireEvent.click(screen.getByRole('button', { name: /Upload instead \(slower\)/i }))
+    expect(screen.getByRole('button', { name: /Choose folder…/i })).toBeTruthy()
+    expect(container.querySelector('input[webkitdirectory]')).toBeNull()
+
+    // Mock showDirectoryPicker
+    const mockFileHandle = {
+      kind: 'file',
+      name: 'index.ts',
+      getFile: vi.fn().mockImplementation(async () => {
+        const f = new File(['export const hello = "world"'], 'index.ts', { type: 'text/typescript' })
+        Object.defineProperty(f, 'lastModified', { value: 1000 })
+        return f
+      }),
+    }
+    const mockDirHandle = {
+      kind: 'directory',
+      name: 'my-cool-app',
+      entries: async function* () {
+        yield ['index.ts', mockFileHandle]
+      },
+    }
+    ;(window as any).showDirectoryPicker = vi.fn().mockResolvedValue(mockDirHandle)
 
     await act(async () => {
-      fireEvent.change(fileInput, { target: { files: [validFile] } })
+      fireEvent.click(screen.getByRole('button', { name: /Choose folder…/i }))
     })
 
-    // Packed summary shown with "Change folder" link
+    // Packed summary shown in FolderReview with "Change folder" link
     expect(await screen.findByText(/Packed 1 files · .* from my-cool-app/i)).toBeTruthy()
     expect(screen.getByRole('button', { name: /Change folder/i })).toBeTruthy()
 
@@ -154,37 +171,6 @@ describe('Folder Selection on Hosted / Vercel Backend', () => {
       expect(uploadFiles).toHaveBeenCalled()
       expect(onStarted).toHaveBeenCalledWith('job-up-1', 'ws-code-1')
     })
-
-    // Empty / ignored-only folder: test inline error
-    const ignoredFile = new File(['# git config'], 'config', { type: 'text/plain' })
-    Object.defineProperty(ignoredFile, 'webkitRelativePath', {
-      value: 'empty-repo/.git/config',
-    })
-
-    // Click Change folder to reset if still reviewing
-    const changeBtn = screen.queryByRole('button', { name: /Change folder/i })
-    if (changeBtn) fireEvent.click(changeBtn)
-
-    const freshInput = container.querySelector('input[type="file"][webkitdirectory]') as HTMLInputElement
-    expect(freshInput).toBeTruthy()
-
-    await act(async () => {
-      fireEvent.change(freshInput, { target: { files: [ignoredFile] } })
-    })
-
-    expect(await screen.findByText('This folder has no source files we can analyze')).toBeTruthy()
-
-    // Browser note when browser cannot pick folders
-    ;(window as any).__MOCK_UNSUPPORTED_FOLDER_BROWSER__ = true
-    const { unmount: unmountOld } = render(
-      <MemoryRouter>
-        <ProjectsForm />
-      </MemoryRouter>
-    )
-    fireEvent.click(screen.getAllByRole('tab', { name: 'Local folder' })[1])
-    expect(screen.getByText('Your browser cannot pick folders; zip the folder and use Upload project instead.')).toBeTruthy()
-    delete (window as any).__MOCK_UNSUPPORTED_FOLDER_BROWSER__
-    unmountOld()
   })
 
   // b) Local (local_paths true): the Local folder tab still shows the path field and Browse button (unchanged behaviour).
